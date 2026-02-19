@@ -1,0 +1,11 @@
+torch
+torchvision
+Pillow
+scikit-learn
+umap-learn
+hdbscan
+pyyaml
+tqdm
+numpy
+matplotlib
+opencv-python
