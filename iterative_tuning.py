@@ -29,6 +29,7 @@ from src.feature_extractor import extract_features
 from src.image_scanner import scan_images
 from src.purity import evaluate_and_save_purity
 from src.reducer import reduce_dimensions
+from src.visualizer import visualize
 
 
 # ==========================
@@ -43,7 +44,7 @@ SEARCH_STRATEGY = "evolution"
 
 # Бюджет запусків (максимум реальних expensive-eval)
 # Це верхня межа кількості ПОВНИХ оцінок (reduce + cluster + purity) за запуск.
-MAX_EVALUATIONS = 120
+MAX_EVALUATIONS = 600
 
 # Параметри еволюційного пошуку (μ + λ GA)
 # EVOLUTION_POPULATION_SIZE  -> розмір популяції в кожному поколінні.
@@ -61,8 +62,8 @@ EVOLUTION_RANDOM_SEED = 42
 # EARLY_STOP_PATIENCE_GENERATIONS -> скільки поколінь чекаємо покращення.
 # EARLY_STOP_MIN_EVALUATIONS      -> мінімум оцінок, після якого дозволено ранню зупинку.
 EARLY_STOP_ENABLED = True
-EARLY_STOP_PATIENCE_GENERATIONS = 4
-EARLY_STOP_MIN_EVALUATIONS = 24
+EARLY_STOP_PATIENCE_GENERATIONS = 24
+EARLY_STOP_MIN_EVALUATIONS = 64
 
 # Двофазний режим:
 #  - фаза 1: швидкий пошук на частині датасету
@@ -95,6 +96,10 @@ SHOW_OVERRIDES_EACH_ITER = False
 SAVE_COMPACT_STDOUT_PER_ITER = False
 # Перші N ітерацій друкуються детально навіть у compact-режимі.
 DETAILED_FIRST_N_ITERS = 2
+
+# Додатковий post-step після тюнінгу:
+# для топ-N кандидатів створити повний пакет візуалізацій як у main.py.
+GENERATE_FULL_VISUALS_FOR_TOP_N = 10
 
 # ==========================
 # GRID SEARCH (БАГАТО ІТЕРАЦІЙ)
@@ -433,6 +438,85 @@ def _save_tuning_plots(summary_dir: Path, results: list[dict], top_results: list
     return created
 
 
+def _generate_full_visualizations_for_top_n(
+    cfg,
+    image_paths,
+    features,
+    results_sorted: list[dict],
+    top_n: int,
+) -> list[dict]:
+    """Generate main-like visualization artifacts for top-N candidates on full data."""
+    if top_n <= 0:
+        return []
+
+    top_rows = results_sorted[:top_n]
+    generated = []
+    total = len(top_rows)
+
+    print("\n[5/5] Повна візуалізація для TOP-кандидатів...")
+    for rank, row in enumerate(top_rows, 1):
+        name = row["name"]
+        print("\n" + "-" * 72)
+        print(f"[{rank}/{total}] TOP-{rank}: {name}")
+        print("  Повторний full-run (reduce + cluster + purity + visualize)...")
+
+        flat = dict(row.get("flat_params", {}))
+        overrides = _flat_to_overrides(flat)
+        red_over = overrides.get("reduction", {})
+        clu_over = overrides.get("clustering", {})
+        pur_over = overrides.get("purity", {})
+
+        rcfg = _apply_section_overrides(cfg.reduction, red_over)
+        ccfg = _apply_section_overrides(cfg.clustering, clu_over)
+        purity_cfg = _apply_section_overrides(cfg.purity, pur_over)
+
+        run_dir = cfg.output_dir / "_tuning" / "_top_visuals" / f"top_{rank:02d}_{name}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        t0 = time.time()
+        embeddings = reduce_dimensions(features, rcfg, cfg.acceleration)
+        labels = cluster(embeddings, ccfg, cfg.acceleration)
+        purity = evaluate_and_save_purity(
+            features=features,
+            embeddings=embeddings,
+            labels=labels,
+            output_dir=run_dir,
+            viz_dir_name=cfg.visualization.viz_dir,
+            cfg=purity_cfg,
+            accel_cfg=cfg.acceleration,
+        )
+        if cfg.visualization.enabled:
+            visualize(
+                image_paths=image_paths,
+                embeddings=embeddings,
+                labels=labels,
+                output_dir=run_dir,
+                cfg=cfg.visualization,
+                preproc_cfg=cfg.preprocessing,
+            )
+        elapsed = time.time() - t0
+
+        viz_dir = run_dir / cfg.visualization.viz_dir
+        generated.append(
+            {
+                "rank": rank,
+                "name": name,
+                "verdict": purity["verdict"],
+                "output_dir": str(run_dir),
+                "viz_dir": str(viz_dir),
+                "purity_report": str(viz_dir / "purity_report_latest.json"),
+                "interactive_scatter": str(viz_dir / "interactive_scatter.html"),
+                "cluster_sizes": str(viz_dir / "cluster_sizes.png"),
+                "cluster_grid": str(viz_dir / "cluster_grid.png"),
+                "preprocessing_comparison": str(viz_dir / "preprocessing_comparison.png"),
+                "elapsed_sec": round(elapsed, 2),
+            }
+        )
+        print(f"  Done: {run_dir} ({elapsed:.1f}s)")
+
+    return generated
+
+
 def _run_evolution_search(
     cfg,
     keys: list[str],
@@ -643,6 +727,7 @@ def main() -> None:
     print(f"Two-phase: {TWO_PHASE_ENABLED} (phase1_fraction={PHASE1_FRACTION})")
     print(f"Early stop: {EARLY_STOP_ENABLED}")
     print(f"Console verbosity: {CONSOLE_VERBOSITY}")
+    print(f"Top full visualizations: {GENERATE_FULL_VISUALS_FOR_TOP_N}")
 
     print("\n[1/4] Сканування зображень...")
     print(f"  Requested acceleration backend: {cfg.acceleration.backend}")
@@ -841,6 +926,25 @@ def main() -> None:
             summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:
         print(f"Plot generation warning: {type(exc).__name__}: {exc}")
+
+    full_visual_runs = []
+    if GENERATE_FULL_VISUALS_FOR_TOP_N > 0:
+        try:
+            full_visual_runs = _generate_full_visualizations_for_top_n(
+                cfg=cfg,
+                image_paths=image_paths,
+                features=features,
+                results_sorted=results_sorted,
+                top_n=GENERATE_FULL_VISUALS_FOR_TOP_N,
+            )
+            if full_visual_runs:
+                summary["top_full_visualizations"] = full_visual_runs
+                summary_path.write_text(
+                    json.dumps(summary, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        except Exception as exc:
+            print(f"Top visualization warning: {type(exc).__name__}: {exc}")
 
     print("=" * 72)
 
