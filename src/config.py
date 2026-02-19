@@ -65,6 +65,14 @@ DEFAULTS = {
         "enabled": True,
         "cache_dir": ".cache",
     },
+    "purity": {
+        "enabled": True,
+        "fail_on_fail": True,
+        "max_centroid_cosine": 0.92,
+        "min_silhouette": 0.25,
+        "max_nn_cross_ratio": 0.5,
+        "k_neighbors": 5,
+    },
 }
 
 
@@ -135,6 +143,16 @@ class CacheConfig:
 
 
 @dataclass
+class PurityConfig:
+    enabled: bool = True
+    fail_on_fail: bool = True
+    max_centroid_cosine: float = 0.92
+    min_silhouette: float = 0.25
+    max_nn_cross_ratio: float = 0.5
+    k_neighbors: int = 5
+
+
+@dataclass
 class Config:
     input_dir: Path = field(default_factory=lambda: Path(""))
     output_dir: Path = field(default_factory=lambda: Path(""))
@@ -149,6 +167,7 @@ class Config:
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     annotations: AnnotationsConfig = field(default_factory=AnnotationsConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
+    purity: PurityConfig = field(default_factory=PurityConfig)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -207,6 +226,10 @@ def _validate(cfg: Config) -> None:
         )
         sys.exit(1)
 
+    if cfg.purity.k_neighbors < 1:
+        print("[ПОМИЛКА] purity.k_neighbors має бути >= 1")
+        sys.exit(1)
+
 
 def load_config(path: str | Path = "config.yaml") -> Config:
     path = Path(path)
@@ -231,6 +254,7 @@ def load_config(path: str | Path = "config.yaml") -> Config:
         visualization=VisualizationConfig(**merged["visualization"]),
         annotations=AnnotationsConfig(**merged["annotations"]),
         cache=CacheConfig(**merged["cache"]),
+        purity=PurityConfig(**merged["purity"]),
     )
 
     _validate(cfg)

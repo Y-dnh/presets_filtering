@@ -17,6 +17,7 @@ from src.reducer import reduce_dimensions
 from src.clusterer import cluster, build_report
 from src.organizer import organize_files
 from src.visualizer import visualize
+from src.purity import evaluate_and_save_purity
 
 
 def main() -> None:
@@ -66,14 +67,34 @@ def main() -> None:
     report = build_report(labels)
     print(report)
 
-    # 6. Візуалізація
+    # 6. Валідація чистоти (до розкладання файлів)
+    if cfg.purity.enabled:
+        print("\n[6/8] Валідація чистоти кластерів...")
+        t0 = time.time()
+        purity_report = evaluate_and_save_purity(
+            features=features,
+            embeddings=embeddings,
+            labels=labels,
+            output_dir=cfg.output_dir,
+            viz_dir_name=cfg.visualization.viz_dir,
+            cfg=cfg.purity,
+        )
+        print(f"  Час: {time.time() - t0:.1f}с")
+        if purity_report["verdict"] == "FAIL" and cfg.purity.fail_on_fail:
+            print("  Purity FAIL: розкладання файлів заблоковано (purity.fail_on_fail: true).")
+            print(f"  Перевірте звіт: {cfg.output_dir / cfg.visualization.viz_dir / 'purity_report_latest.json'}")
+            sys.exit(2)
+    else:
+        print("\n[6/8] Валідація чистоти вимкнена (purity.enabled: false)")
+
+    # 7. Візуалізація
     if cfg.visualization.enabled:
-        print("[6/7] Візуалізація...")
+        print("[7/8] Візуалізація...")
         t0 = time.time()
         visualize(image_paths, embeddings, labels, cfg.output_dir, cfg.visualization, cfg.preprocessing)
         print(f"  Час: {time.time() - t0:.1f}с")
     else:
-        print("[6/7] Візуалізація вимкнена (visualization.enabled: false)")
+        print("[7/8] Візуалізація вимкнена (visualization.enabled: false)")
 
     # 7. Підтвердження та організація
     answer = input("\nПродовжити розкладання файлів? (y/n): ").strip().lower()
@@ -81,7 +102,7 @@ def main() -> None:
         print("Скасовано.")
         sys.exit(0)
 
-    print("\n[7/7] Організація файлів...")
+    print("\n[8/8] Організація файлів...")
     t0 = time.time()
     organize_files(image_paths, labels, cfg.output_dir, cfg.mode, cfg.annotations)
     print(f"  Час: {time.time() - t0:.1f}с")
