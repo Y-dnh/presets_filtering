@@ -36,62 +36,52 @@ BASE_CONFIG_PATH = "config.yaml"
 # ==========================
 # GRID SEARCH (БАГАТО ІТЕРАЦІЙ)
 # ==========================
-GRID = {
-    "umap_components": [3, 4, 5],
-    "umap_n_neighbors": [30, 45, 60, 80],
-    "umap_min_dist": [0.0],
-    "min_cluster_size": [80, 100, 140, 180, 240, 320],
-    "min_samples": [3, 5, 8, 12, 16],
-    "cluster_selection_epsilon": [0.2, 0.4, 0.6, 0.9, 1.2, 1.6],
-    "cluster_selection_method": ["leaf", "eom"],
+SEARCH_SPACE = {
+    # reduction.*
+    "reduction.umap_components": [3, 4, 5],
+    "reduction.umap_n_neighbors": [30, 45, 60, 80],
+    "reduction.umap_min_dist": [0.0],
+    # clustering.*
+    "clustering.min_cluster_size": [80, 100, 140, 180, 240, 320],
+    "clustering.min_samples": [3, 5, 8, 12, 16],
+    "clustering.cluster_selection_epsilon": [0.2, 0.4, 0.6, 0.9, 1.2, 1.6],
+    "clustering.cluster_selection_method": ["leaf", "eom"],
+    # purity.* (за потреби можна тюнити пороги теж)
+    # Наприклад:
+    # "purity.max_nn_cross_ratio": [0.4, 0.5, 0.6],
 }
 
-# Повний grid тут = 3*4*1*6*5*6*2 = 4320 комбінацій.
+# Повний grid за замовчуванням: 3*4*1*6*5*6*2 = 4320 комбінацій.
 # За замовчуванням беремо репрезентативну підмножину для "нічного" прогона.
 DEFAULT_MAX_TRIALS = 240
 
 
 def _build_iterations(max_trials: int) -> list[dict]:
+    keys = list(SEARCH_SPACE.keys())
+    values_grid = [SEARCH_SPACE[k] for k in keys]
     all_combos = []
-    idx = 0
-    for combo in product(
-        GRID["umap_components"],
-        GRID["umap_n_neighbors"],
-        GRID["umap_min_dist"],
-        GRID["min_cluster_size"],
-        GRID["min_samples"],
-        GRID["cluster_selection_epsilon"],
-        GRID["cluster_selection_method"],
-    ):
-        idx += 1
-        (
-            umap_components,
-            umap_n_neighbors,
-            umap_min_dist,
-            min_cluster_size,
-            min_samples,
-            cluster_selection_epsilon,
-            cluster_selection_method,
-        ) = combo
+    for idx, combo in enumerate(product(*values_grid), 1):
+        flat = dict(zip(keys, combo))
+        overrides: dict = {}
+        for dotted_key, value in flat.items():
+            section, param = dotted_key.split(".", 1)
+            overrides.setdefault(section, {})
+            overrides[section][param] = value
+
+        # Формуємо стабільну коротку назву ітерації.
+        tokens = []
+        for dotted_key in keys:
+            section, param = dotted_key.split(".", 1)
+            value = flat[dotted_key]
+            short = param.replace("cluster_selection_", "csel_").replace("_", "")
+            val_s = str(value).replace(".", "_")
+            tokens.append(f"{section[0]}{short}{val_s}")
+        name = f"iter_{idx:04d}_" + "_".join(tokens[:6])
+
         all_combos.append(
             {
-                "name": (
-                    f"iter_{idx:04d}_u{umap_components}_n{umap_n_neighbors}_"
-                    f"mcs{min_cluster_size}_ms{min_samples}_"
-                    f"eps{str(cluster_selection_epsilon).replace('.', '_')}_"
-                    f"{cluster_selection_method}"
-                ),
-                "reduction": {
-                    "umap_components": umap_components,
-                    "umap_n_neighbors": umap_n_neighbors,
-                    "umap_min_dist": umap_min_dist,
-                },
-                "clustering": {
-                    "min_cluster_size": min_cluster_size,
-                    "min_samples": min_samples,
-                    "cluster_selection_epsilon": cluster_selection_epsilon,
-                    "cluster_selection_method": cluster_selection_method,
-                },
+                "name": name,
+                "overrides": overrides,
             }
         )
 
@@ -107,6 +97,15 @@ def _build_iterations(max_trials: int) -> list[dict]:
             used.add(pos)
             selected.append(all_combos[pos])
     return selected
+
+
+def _apply_section_overrides(base_cfg, overrides: dict):
+    cfg = copy.deepcopy(base_cfg)
+    for key, value in overrides.items():
+        if not hasattr(cfg, key):
+            raise ValueError(f"Невідомий параметр '{key}' для секції {type(cfg).__name__}")
+        setattr(cfg, key, value)
+    return cfg
 
 
 def _score_for_sort(item: dict) -> tuple:
@@ -168,15 +167,16 @@ def main() -> None:
         print("\n" + "-" * 72)
         print(f"[{idx}/{total}] {name}")
 
-        rcfg = copy.deepcopy(cfg.reduction)
-        ccfg = copy.deepcopy(cfg.clustering)
-        for k, v in it["reduction"].items():
-            setattr(rcfg, k, v)
-        for k, v in it["clustering"].items():
-            setattr(ccfg, k, v)
+        overrides = it.get("overrides", {})
+        red_over = overrides.get("reduction", {})
+        clu_over = overrides.get("clustering", {})
+        pur_over = overrides.get("purity", {})
 
-        print(f"  reduction:  {it['reduction']}")
-        print(f"  clustering: {it['clustering']}")
+        rcfg = _apply_section_overrides(cfg.reduction, red_over)
+        ccfg = _apply_section_overrides(cfg.clustering, clu_over)
+        purity_cfg = _apply_section_overrides(cfg.purity, pur_over)
+
+        print(f"  overrides: {overrides}")
 
         try:
             embeddings = reduce_dimensions(features, rcfg)
@@ -189,7 +189,7 @@ def main() -> None:
                 labels=labels,
                 output_dir=trial_output,
                 viz_dir_name="viz",
-                cfg=cfg.purity,
+                cfg=purity_cfg,
             )
 
             m = purity["metrics"]
@@ -202,7 +202,7 @@ def main() -> None:
                 "max_nn_cross_ratio": m["max_nn_cross_ratio"],
                 "leakage_candidates": len(purity.get("leakage_candidates", [])),
                 "report_path": str(trial_output / "viz" / "purity_report_latest.json"),
-                "params": {"reduction": it["reduction"], "clustering": it["clustering"]},
+                "params": overrides,
                 "status": "ok",
             }
         except Exception as exc:
@@ -215,7 +215,7 @@ def main() -> None:
                 "max_nn_cross_ratio": None,
                 "leakage_candidates": -1,
                 "report_path": "",
-                "params": {"reduction": it["reduction"], "clustering": it["clustering"]},
+                "params": overrides,
                 "status": f"error: {type(exc).__name__}: {exc}",
             }
 
