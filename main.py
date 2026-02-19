@@ -54,13 +54,13 @@ def main() -> None:
     # 4. Зменшення розмірності
     print("\n[4/7] Зменшення розмірності (PCA + UMAP)...")
     t0 = time.time()
-    embeddings = reduce_dimensions(features, cfg.reduction)
+    embeddings = reduce_dimensions(features, cfg.reduction, cfg.acceleration)
     print(f"  Час: {time.time() - t0:.1f}с")
 
     # 5. Кластеризація
     print("\n[5/7] Кластеризація (HDBSCAN)...")
     t0 = time.time()
-    labels = cluster(embeddings, cfg.clustering)
+    labels = cluster(embeddings, cfg.clustering, cfg.acceleration)
     print(f"  Час: {time.time() - t0:.1f}с")
 
     # Звіт
@@ -78,6 +78,7 @@ def main() -> None:
             output_dir=cfg.output_dir,
             viz_dir_name=cfg.visualization.viz_dir,
             cfg=cfg.purity,
+            accel_cfg=cfg.acceleration,
         )
         print(f"  Час: {time.time() - t0:.1f}с")
         if purity_report["verdict"] == "FAIL" and cfg.purity.fail_on_fail:

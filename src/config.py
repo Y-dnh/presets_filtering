@@ -65,11 +65,16 @@ DEFAULTS = {
         "enabled": True,
         "cache_dir": ".cache",
     },
+    "acceleration": {
+        "backend": "auto",
+    },
     "purity": {
         "enabled": True,
         "fail_on_fail": True,
         "max_centroid_cosine": 0.92,
         "min_silhouette": 0.25,
+        "silhouette_sample_size": 10000,
+        "silhouette_random_state": 42,
         "max_nn_cross_ratio": 0.5,
         "k_neighbors": 5,
     },
@@ -143,11 +148,18 @@ class CacheConfig:
 
 
 @dataclass
+class AccelerationConfig:
+    backend: str = "auto"
+
+
+@dataclass
 class PurityConfig:
     enabled: bool = True
     fail_on_fail: bool = True
     max_centroid_cosine: float = 0.92
     min_silhouette: float = 0.25
+    silhouette_sample_size: int = 10000
+    silhouette_random_state: int = 42
     max_nn_cross_ratio: float = 0.5
     k_neighbors: int = 5
 
@@ -167,6 +179,7 @@ class Config:
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     annotations: AnnotationsConfig = field(default_factory=AnnotationsConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
+    acceleration: AccelerationConfig = field(default_factory=AccelerationConfig)
     purity: PurityConfig = field(default_factory=PurityConfig)
 
 
@@ -230,6 +243,14 @@ def _validate(cfg: Config) -> None:
         print("[ПОМИЛКА] purity.k_neighbors має бути >= 1")
         sys.exit(1)
 
+    if cfg.purity.silhouette_sample_size < 1:
+        print("[ПОМИЛКА] purity.silhouette_sample_size має бути >= 1")
+        sys.exit(1)
+
+    if cfg.acceleration.backend not in ("auto", "cpu", "cuda"):
+        print("[ПОМИЛКА] acceleration.backend має бути 'auto', 'cpu' або 'cuda'")
+        sys.exit(1)
+
 
 def load_config(path: str | Path = "config.yaml") -> Config:
     path = Path(path)
@@ -254,6 +275,7 @@ def load_config(path: str | Path = "config.yaml") -> Config:
         visualization=VisualizationConfig(**merged["visualization"]),
         annotations=AnnotationsConfig(**merged["annotations"]),
         cache=CacheConfig(**merged["cache"]),
+        acceleration=AccelerationConfig(**merged["acceleration"]),
         purity=PurityConfig(**merged["purity"]),
     )
 

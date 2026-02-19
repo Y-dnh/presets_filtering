@@ -2,12 +2,12 @@
 
 # Шлях до папки із зображеннями. Може містити підпапки --
 # скрипт рекурсивно знайде всі зображення і об'єднає в один пул.
-input_dir: "D:/datasets_images/dataset"
-
+# input_dir: "D:/datasets_images/dataset"
+input_dir: "/mnt/d/datasets_images/dataset"
 # Шлях куди будуть розкладені зображення по папках пресетів.
 # Створюється автоматично. Всередині: preset_000/, preset_001/, ...
-output_dir: "D:/dataset_filtered_by_presets"
-
+# output_dir: "D:/dataset_filtered_by_presets"
+output_dir: "/mnt/d/dataset_filtered_by_presets"
 # Режим переміщення файлів:
 #   "copy" -- копіює (оригінали залишаються на місці)
 #   "move" -- переміщує (оригінали видаляються зі старого місця)
@@ -57,6 +57,14 @@ model:
   # true -- рекомендовано при використанні GPU. Трохи більше RAM.
   # false -- якщо мало оперативної пам'яті або device: "cpu".
   pin_memory: true
+
+# ===== Прискорення обчислень (PCA/UMAP/HDBSCAN/Purity) =====
+acceleration:
+  # backend:
+  #   "auto" -- пробує CUDA (RAPIDS cuML), при недоступності fallback на CPU
+  #   "cuda" -- пріоритет CUDA, при помилці/відсутності бібліотек fallback на CPU з warning
+  #   "cpu"  -- примусово CPU
+  backend: "auto"
 
 # ===== Препроцесинг зображень =====
 # Критично важливо для тепловізійних камер!
@@ -211,6 +219,12 @@ purity:
 
   # Нижня межа середнього silhouette score в UMAP-просторі.
   min_silhouette: 0.25
+
+  # Скільки точок брати для silhouette (повний підрахунок O(N^2) занадто дорогий).
+  silhouette_sample_size: 10000
+
+  # Seed для відтворюваного семплінгу silhouette.
+  silhouette_random_state: 42
 
   # Верхня межа міжкластерного перетоку (частка kNN з інших кластерів).
   max_nn_cross_ratio: 0.5

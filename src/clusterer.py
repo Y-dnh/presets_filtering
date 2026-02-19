@@ -6,23 +6,68 @@ import hdbscan
 import numpy as np
 from sklearn.neighbors import NearestCentroid
 
-from .config import ClusteringConfig
+from .config import AccelerationConfig, ClusteringConfig
+
+_LAST_CLUSTERING_BACKEND = "cpu"
 
 
-def cluster(embeddings: np.ndarray, cfg: ClusteringConfig) -> np.ndarray:
+def _resolve_backend(accel_cfg: AccelerationConfig) -> str:
+    mode = accel_cfg.backend
+    if mode == "cpu":
+        return "cpu"
+    try:
+        import cupy  # noqa: F401
+        from cuml.cluster import HDBSCAN as _  # noqa: F401
+        return "rapids"
+    except Exception:
+        if mode == "cuda":
+            print("  [WARN] CUDA backend недоступний, fallback на CPU.")
+        return "cpu"
+
+
+def cluster(
+    embeddings: np.ndarray,
+    cfg: ClusteringConfig,
+    accel_cfg: AccelerationConfig,
+) -> np.ndarray:
     """Run HDBSCAN on embeddings and return cluster labels (0-indexed).
 
     Noise points (label == -1) are either kept separate or reassigned to the
     nearest cluster depending on ``cfg.noise_handling``.
     """
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=cfg.min_cluster_size,
-        min_samples=cfg.min_samples,
-        cluster_selection_epsilon=cfg.cluster_selection_epsilon,
-        cluster_selection_method=cfg.cluster_selection_method,
-        metric="euclidean",
-    )
-    labels = clusterer.fit_predict(embeddings)
+    global _LAST_CLUSTERING_BACKEND
+    backend = _resolve_backend(accel_cfg)
+    print(f"  Backend (clustering): {'RAPIDS (GPU)' if backend == 'rapids' else 'CPU'}")
+
+    labels = None
+    if backend == "rapids":
+        try:
+            import cupy as cp
+            from cuml.cluster import HDBSCAN as cuHDBSCAN
+
+            emb_gpu = cp.asarray(embeddings)
+            clusterer = cuHDBSCAN(
+                min_cluster_size=cfg.min_cluster_size,
+                min_samples=cfg.min_samples,
+                cluster_selection_epsilon=cfg.cluster_selection_epsilon,
+                cluster_selection_method=cfg.cluster_selection_method,
+                metric="euclidean",
+            )
+            labels_gpu = clusterer.fit_predict(emb_gpu)
+            labels = cp.asnumpy(labels_gpu).astype(int)
+        except Exception as exc:
+            print(f"  [WARN] CUDA HDBSCAN error ({type(exc).__name__}), fallback на CPU.")
+
+    if labels is None:
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=cfg.min_cluster_size,
+            min_samples=cfg.min_samples,
+            cluster_selection_epsilon=cfg.cluster_selection_epsilon,
+            cluster_selection_method=cfg.cluster_selection_method,
+            metric="euclidean",
+        )
+        labels = clusterer.fit_predict(embeddings)
+        backend = "cpu"
 
     n_clusters = len(set(labels) - {-1})
     n_noise = int((labels == -1).sum())
@@ -34,6 +79,7 @@ def cluster(embeddings: np.ndarray, cfg: ClusteringConfig) -> np.ndarray:
         print(f"  Шумові точки призначено до найближчих кластерів")
 
     labels = _renumber_labels(labels)
+    _LAST_CLUSTERING_BACKEND = backend
     return labels
 
 

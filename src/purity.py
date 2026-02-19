@@ -9,7 +9,9 @@ import numpy as np
 from sklearn.metrics import silhouette_score
 from sklearn.neighbors import NearestNeighbors
 
-from .config import PurityConfig
+from .config import AccelerationConfig, PurityConfig
+
+_RAPIDS_PURITY_DISABLED = False
 
 
 def _safe_float(value: float | None) -> float | None:
@@ -23,6 +25,33 @@ def _pairwise_euclidean(x: np.ndarray) -> np.ndarray:
     return np.linalg.norm(diff, axis=2)
 
 
+def _resolve_backend(accel_cfg: AccelerationConfig) -> str:
+    global _RAPIDS_PURITY_DISABLED
+    mode = accel_cfg.backend
+    if mode == "cpu":
+        return "cpu"
+    if _RAPIDS_PURITY_DISABLED:
+        return "cpu"
+    try:
+        import cupy as cp
+        from cuml.metrics.cluster import silhouette_score as _  # noqa: F401
+        from cuml.neighbors import NearestNeighbors as _  # noqa: F401
+
+        # Runtime health check for CuPy JIT: some mixed environments
+        # (conda RAPIDS + pip torch wheels) can break NVRTC compilation.
+        try:
+            _ = cp.asnumpy(cp.arange(8, dtype=cp.float32).sum())
+        except Exception:
+            if mode in ("auto", "cuda"):
+                print("  [WARN] CuPy JIT unhealthy, fallback purity на CPU.")
+            return "cpu"
+        return "rapids"
+    except Exception:
+        if mode == "cuda":
+            print("  [WARN] CUDA backend недоступний для purity, fallback на CPU.")
+        return "cpu"
+
+
 def evaluate_and_save_purity(
     features: np.ndarray,
     embeddings: np.ndarray,
@@ -30,8 +59,10 @@ def evaluate_and_save_purity(
     output_dir: Path,
     viz_dir_name: str,
     cfg: PurityConfig,
+    accel_cfg: AccelerationConfig,
 ) -> Dict:
     """Evaluate cluster isolation and save purity report artifacts."""
+    global _RAPIDS_PURITY_DISABLED
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(output_dir)
     viz_dir = output_dir / viz_dir_name
@@ -42,6 +73,8 @@ def evaluate_and_save_purity(
     valid_embeddings = embeddings[valid_mask]
     valid_labels = labels[valid_mask]
     cluster_ids = sorted(set(valid_labels.tolist()))
+    backend = _resolve_backend(accel_cfg)
+    print(f"  Backend (purity): {'RAPIDS (GPU)' if backend == 'rapids' else 'CPU'}")
 
     report: Dict = {
         "run": {
@@ -91,8 +124,24 @@ def evaluate_and_save_purity(
     centroids_f = np.stack(cluster_centroids_f, axis=0)
     centroids_e = np.stack(cluster_centroids_e, axis=0)
 
-    cosine_matrix = centroids_f @ centroids_f.T
-    dist_matrix = _pairwise_euclidean(centroids_e)
+    if backend == "rapids":
+        try:
+            import cupy as cp
+
+            c_f = cp.asarray(centroids_f)
+            c_e = cp.asarray(centroids_e)
+            cosine_matrix = cp.asnumpy(c_f @ c_f.T)
+            diff = c_e[:, None, :] - c_e[None, :, :]
+            dist_matrix = cp.asnumpy(cp.linalg.norm(diff, axis=2))
+        except Exception as exc:
+            print(f"  [WARN] CUDA purity matrix error ({type(exc).__name__}), fallback на CPU.")
+            cosine_matrix = centroids_f @ centroids_f.T
+            dist_matrix = _pairwise_euclidean(centroids_e)
+            backend = "cpu"
+            _RAPIDS_PURITY_DISABLED = True
+    else:
+        cosine_matrix = centroids_f @ centroids_f.T
+        dist_matrix = _pairwise_euclidean(centroids_e)
 
     diag = np.eye(len(cluster_ids), dtype=bool)
     cosine_off = cosine_matrix[~diag]
@@ -103,8 +152,32 @@ def evaluate_and_save_purity(
     # --- Silhouette in embedding-space ---
     silhouette = None
     if len(valid_embeddings) > len(cluster_ids):
+        sil_embeddings = valid_embeddings
+        sil_labels = valid_labels
+        if len(valid_embeddings) > cfg.silhouette_sample_size:
+            rng = np.random.default_rng(cfg.silhouette_random_state)
+            sample_idx = rng.choice(
+                len(valid_embeddings),
+                size=cfg.silhouette_sample_size,
+                replace=False,
+            )
+            sil_embeddings = valid_embeddings[sample_idx]
+            sil_labels = valid_labels[sample_idx]
         try:
-            silhouette = float(silhouette_score(valid_embeddings, valid_labels))
+            if backend == "rapids":
+                import cupy as cp
+                from cuml.metrics.cluster import silhouette_score as cu_silhouette_score
+
+                silhouette = float(
+                    cp.asnumpy(
+                        cu_silhouette_score(
+                            cp.asarray(sil_embeddings),
+                            cp.asarray(sil_labels),
+                        )
+                    )
+                )
+            else:
+                silhouette = float(silhouette_score(sil_embeddings, sil_labels))
         except Exception:
             silhouette = None
 
@@ -112,25 +185,54 @@ def evaluate_and_save_purity(
     n_samples = len(valid_labels)
     k = min(cfg.k_neighbors, max(1, n_samples - 1))
     n_neighbors = min(k + 1, n_samples)
-    nn = NearestNeighbors(n_neighbors=n_neighbors, metric="cosine")
-    nn.fit(valid_features)
-    indices = nn.kneighbors(return_distance=False)
+    if backend == "rapids":
+        try:
+            import cupy as cp
+            from cuml.neighbors import NearestNeighbors as cuNearestNeighbors
+
+            nn = cuNearestNeighbors(n_neighbors=n_neighbors, metric="cosine")
+            nn.fit(cp.asarray(valid_features))
+            indices = cp.asnumpy(nn.kneighbors(return_distance=False))
+        except Exception as exc:
+            print(f"  [WARN] CUDA purity kNN error ({type(exc).__name__}), fallback на CPU.")
+            nn = NearestNeighbors(n_neighbors=n_neighbors, metric="cosine")
+            nn.fit(valid_features)
+            indices = nn.kneighbors(return_distance=False)
+            backend = "cpu"
+            _RAPIDS_PURITY_DISABLED = True
+    else:
+        nn = NearestNeighbors(n_neighbors=n_neighbors, metric="cosine")
+        nn.fit(valid_features)
+        indices = nn.kneighbors(return_distance=False)
 
     per_cluster_ratios: Dict[int, List[float]] = {cid: [] for cid in cluster_ids}
     neighbor_cluster_votes: Dict[int, Dict[int, int]] = {cid: {} for cid in cluster_ids}
 
-    for i in range(n_samples):
-        own_cid = int(valid_labels[i])
-        neigh = indices[i].tolist()
-        neigh = [j for j in neigh if j != i][:k]
-        if not neigh:
-            continue
-        neigh_labels = [int(valid_labels[j]) for j in neigh]
-        cross = [c for c in neigh_labels if c != own_cid]
-        ratio = len(cross) / len(neigh_labels)
-        per_cluster_ratios[own_cid].append(ratio)
-        for c in cross:
-            neighbor_cluster_votes[own_cid][c] = neighbor_cluster_votes[own_cid].get(c, 0) + 1
+    neigh_idx = indices[:, 1:k + 1] if indices.shape[1] > 1 else indices[:, :0]
+    if neigh_idx.shape[1] > 0:
+        neighbor_labels = valid_labels[neigh_idx]
+        own_labels = valid_labels[:, None]
+        cross_mask = neighbor_labels != own_labels
+        ratios = cross_mask.sum(axis=1) / neigh_idx.shape[1]
+
+        for cid in cluster_ids:
+            cid_mask = valid_labels == cid
+            if np.any(cid_mask):
+                per_cluster_ratios[cid] = ratios[cid_mask].tolist()
+
+        # Dominant cross-neighbor cluster per source cluster.
+        cross_sources, cross_pos = np.where(cross_mask)
+        if cross_sources.size > 0:
+            src_clusters = valid_labels[cross_sources]
+            dst_clusters = neighbor_labels[cross_sources, cross_pos]
+            for cid in cluster_ids:
+                mask = src_clusters == cid
+                if not np.any(mask):
+                    continue
+                vals, counts = np.unique(dst_clusters[mask], return_counts=True)
+                neighbor_cluster_votes[cid] = {
+                    int(v): int(c) for v, c in zip(vals.tolist(), counts.tolist())
+                }
 
     per_cluster_mean_ratio = {
         cid: float(np.mean(vals)) if vals else 0.0

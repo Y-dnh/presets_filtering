@@ -1,0 +1,20 @@
+# Lightweight dependencies for tuning script in RAPIDS env.
+# RAPIDS stack (cuml/cudf/cupy) should be installed via conda, not pip.
+#
+# Recommended:
+#   conda create -n rapids-25.10 -c rapidsai -c conda-forge -c nvidia rapids=25.10 python=3.10 cuda-version=12.5
+#   conda activate rapids-25.10
+#   pip install -r requirements_rapids_tuning.txt
+#
+# NOTE:
+# - Do NOT install torch/torchvision via pip in this env (can break RAPIDS CUDA deps).
+# - Keep this env focused on iterative_tuning + fallback CPU libs.
+
+numpy
+scikit-learn
+umap-learn
+hdbscan
+pyyaml
+tqdm
+matplotlib
+opencv-python

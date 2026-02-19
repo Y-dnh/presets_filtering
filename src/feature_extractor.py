@@ -15,6 +15,9 @@ from tqdm import tqdm
 
 from .config import CacheConfig, ModelConfig, PreprocessingConfig
 
+# Avoid OpenCV thread oversubscription inside PyTorch DataLoader workers.
+cv2.setNumThreads(0)
+
 
 def _resolve_device(device_cfg: str) -> torch.device:
     if device_cfg == "auto":
