@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
 import io
 import json
@@ -438,6 +439,46 @@ def _save_tuning_plots(summary_dir: Path, results: list[dict], top_results: list
     return created
 
 
+def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
+    """Save all tuning runs and metrics to CSV."""
+    csv_path = summary_dir / "tuning_results_all.csv"
+    fieldnames = [
+        "name",
+        "status",
+        "verdict",
+        "n_clusters",
+        "max_centroid_cosine",
+        "silhouette",
+        "max_nn_cross_ratio",
+        "leakage_candidates",
+        "warn_count",
+        "elapsed_sec",
+        "report_path",
+        "params_json",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in results:
+            writer.writerow(
+                {
+                    "name": row.get("name", ""),
+                    "status": row.get("status", ""),
+                    "verdict": row.get("verdict", ""),
+                    "n_clusters": row.get("n_clusters"),
+                    "max_centroid_cosine": row.get("max_centroid_cosine"),
+                    "silhouette": row.get("silhouette"),
+                    "max_nn_cross_ratio": row.get("max_nn_cross_ratio"),
+                    "leakage_candidates": row.get("leakage_candidates"),
+                    "warn_count": row.get("warn_count", 0),
+                    "elapsed_sec": row.get("elapsed_sec"),
+                    "report_path": row.get("report_path", ""),
+                    "params_json": json.dumps(row.get("params", {}), ensure_ascii=False),
+                }
+            )
+    return csv_path
+
+
 def _generate_full_visualizations_for_top_n(
     cfg,
     image_paths,
@@ -632,9 +673,11 @@ def _run_evolution_search(
                     "status": f"error: {type(exc).__name__}: {exc}",
                 }
 
+            elapsed_iter = time.time() - t_iter
+            row["elapsed_sec"] = round(elapsed_iter, 4)
             results.append(row)
             gen_rows.append(row)
-            log_result(eval_count, max_trials, row, time.time() - t_iter)
+            log_result(eval_count, max_trials, row, elapsed_iter)
 
         ok_pool = [r for r in gen_rows if r["status"] == "ok"]
         improved = False
@@ -819,8 +862,10 @@ def main() -> None:
                     "flat_params": flat,
                     "status": f"error: {type(exc).__name__}: {exc}",
                 }
+            elapsed_iter = time.time() - t_iter
+            row["elapsed_sec"] = round(elapsed_iter, 4)
             results.append(row)
-            log_result(idx, total, row, time.time() - t_iter)
+            log_result(idx, total, row, elapsed_iter)
     elif strategy == "evolution":
         if TWO_PHASE_ENABLED:
             phase1_budget = max(1, int(max_trials * PHASE1_BUDGET_RATIO))
@@ -915,6 +960,10 @@ def main() -> None:
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Summary: {summary_path}")
+    csv_path = _save_all_results_csv(summary_dir, results)
+    print(f"All runs CSV: {csv_path}")
+    summary["all_results_csv"] = str(csv_path)
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     try:
         plot_paths = _save_tuning_plots(summary_dir, results, results_sorted)
