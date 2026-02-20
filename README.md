@@ -397,29 +397,50 @@ PCA прибирає лінійний шум і зменшує розмірні�
 - `acceleration.backend` впливає на reduction/clustering/purity.
 - Якщо CUDA-бібліотеки RAPIDS не встановлені, скрипт автоматично перейде на CPU і виведе warning.
 
-#### Рекомендоване встановлення RAPIDS у WSL2 (Ubuntu)
+#### Рекомендоване встановлення RAPIDS + PyTorch у WSL2 (Ubuntu)
 
-1) Створіть окреме середовище RAPIDS:
+Нижче робочий сценарій для одного env у WSL2 (перевірено для `rapids=26.02`, `python=3.11`, `CUDA 12.2-12.9`).
 
-```bash
-conda create -n rapids-25.10 -c rapidsai -c conda-forge -c nvidia rapids=25.10 python=3.10 cuda-version=12.5
-conda activate rapids-25.10
-```
-
-2) Встановіть залежності тюнінгу (безпечний варіант для RAPIDS env):
+1) Створіть conda-середовище RAPIDS:
 
 ```bash
-pip install -r requirements_rapids_tuning.txt
+conda create -p /mnt/d/projects_yaroslav/dataset_filtering_by_presets/wsl2_rapids_env \
+  -c rapidsai -c conda-forge -c nvidia \
+  rapids=26.02 python=3.11 \
+  'cuda-version>=12.2,<=12.9' \
+  dash --solver=libmamba
 ```
 
-`requirements_rapids_tuning.txt` навмисно не містить `torch/torchvision`, щоб не ламати RAPIDS CUDA-залежності.
+2) Активуйте env:
 
-3) Налаштуйте Linux-шляхи у `config.yaml`:
+```bash
+conda activate /mnt/d/projects_yaroslav/dataset_filtering_by_presets/wsl2_rapids_env
+```
+
+3) Додайте PyTorch (CUDA build) через conda:
+
+```bash
+conda install -c rapidsai -c conda-forge -c nvidia 'pytorch=*=*cuda*' --solver=libmamba
+```
+
+4) Додайте `torchvision` через conda:
+
+```bash
+conda install -c conda-forge -c nvidia torchvision --solver=libmamba
+```
+
+5) Перевірте імпорти:
+
+```bash
+python -c "import torch; import torchvision; import cudf; print('All systems GO')"
+```
+
+6) Налаштуйте Linux-шляхи у `config.yaml`:
 
 - `input_dir: "/mnt/d/datasets_images/dataset"`
 - `output_dir: "/mnt/d/dataset_filtered_by_presets"`
 
-4) Увімкніть auto backend:
+7) Увімкніть auto backend:
 
 ```yaml
 acceleration:
@@ -442,7 +463,7 @@ python -c "import torch; print('torch', torch.__version__); print('cuda', torch.
 
 #### Важливо про `pip install torch` у RAPIDS env
 
-Не рекомендується ставити `torch/torchvision` через `pip` поверх RAPIDS-середовища, бо це може перезаписати CUDA-залежності (`cuda-bindings`, `cuda-python`) і зламати `cupy/cuml`.
+Рекомендовано ставити `torch/torchvision` саме через `conda` (як у прикладі вище). Встановлення через `pip` поверх RAPIDS-середовища може перезаписати CUDA-залежності (`cuda-bindings`, `cuda-python`) і зламати `cupy/cuml`.
 
 Якщо так сталося:
 
