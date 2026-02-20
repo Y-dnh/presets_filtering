@@ -22,7 +22,6 @@ import shutil
 import random
 import time
 from contextlib import redirect_stdout
-from itertools import product
 from pathlib import Path
 
 from src.clusterer import cluster
@@ -39,14 +38,12 @@ from src.visualizer import visualize
 # ==========================
 BASE_CONFIG_PATH = "config.yaml"
 
-# Режим пошуку: "evolution" або "grid"
-# evolution  -> генетичний пошук (рекомендовано для довгих запусків)
-# grid       -> рівномірна вибірка з повного декартового простору SEARCH_SPACE
+# Режим пошуку: тільки еволюційний (генетичний алгоритм).
 SEARCH_STRATEGY = "evolution"
 
 # Бюджет запусків (максимум реальних expensive-eval)
 # Це верхня межа кількості ПОВНИХ оцінок (reduce + cluster + purity) за запуск.
-MAX_EVALUATIONS = 20
+MAX_EVALUATIONS = 24
 
 # Параметри еволюційного пошуку (μ + λ GA)
 # EVOLUTION_POPULATION_SIZE  -> розмір популяції в кожному поколінні.
@@ -54,33 +51,33 @@ MAX_EVALUATIONS = 20
 # EVOLUTION_TOURNAMENT_SIZE  -> розмір турніру при selection (більше = сильніший тиск відбору).
 # EVOLUTION_MUTATION_RATE    -> ймовірність мутації кожного гена.
 # EVOLUTION_RANDOM_SEED      -> фіксує відтворюваність генерації кандидатів.
-EVOLUTION_POPULATION_SIZE = 12
-EVOLUTION_ELITE_SIZE = 4
-EVOLUTION_TOURNAMENT_SIZE = 3
-EVOLUTION_MUTATION_RATE = 0.25
+EVOLUTION_POPULATION_SIZE = 24
+EVOLUTION_ELITE_SIZE = 6
+EVOLUTION_TOURNAMENT_SIZE = 4
+EVOLUTION_MUTATION_RATE = 0.22
 EVOLUTION_RANDOM_SEED = 42
 
 # Early stop (плато): зупиняти, якщо немає покращення best score
 # EARLY_STOP_PATIENCE_GENERATIONS -> скільки поколінь чекаємо покращення.
 # EARLY_STOP_MIN_EVALUATIONS      -> мінімум оцінок, після якого дозволено ранню зупинку.
 EARLY_STOP_ENABLED = True
-EARLY_STOP_PATIENCE_GENERATIONS = 24
-EARLY_STOP_MIN_EVALUATIONS = 64
+EARLY_STOP_PATIENCE_GENERATIONS = 60
+EARLY_STOP_MIN_EVALUATIONS = 2000
 
 # Двофазний режим:
-#  - фаза 1: швидкий пошук на частині датасету
-#  - фаза 2: уточнення топ-кандидатів на 100% даних
+#  - старт еволюції на частині датасету
+#  - автоматичний свіч на 100% при плато/повільному покращенні
 # PHASE1_FRACTION      -> частка датасету для фази 1 (0.5 = 50% кадрів).
-# PHASE1_BUDGET_RATIO  -> частка бюджету MAX_EVALUATIONS для фази 1.
-# PHASE2_TOP_K_SEEDS   -> скільки кращих кандидатів із фази 1 сідують у фазу 2.
+# SWITCH_PATIENCE_GENERATIONS -> скільки поколінь без суттєвого прогресу до свічу.
+# SWITCH_MIN_EVALUATIONS      -> мінімум eval перед дозволом свічу.
+# SWITCH_MIN_REL_IMPROVEMENT  -> мін. відносне покращення best score за вікно; менше => "повільно".
+# SWITCH_REEVAL_ELITES_TOP_K  -> скільки еліт переоцінити на full одразу після свічу.
 TWO_PHASE_ENABLED = True
 PHASE1_FRACTION = 0.5
-PHASE1_BUDGET_RATIO = 0.6
-PHASE2_TOP_K_SEEDS = 16
-
-# Параметри grid fallback
-# Використовується лише коли SEARCH_STRATEGY="grid".
-GRID_MAX_TRIALS = MAX_EVALUATIONS
+SWITCH_PATIENCE_GENERATIONS = 20
+SWITCH_MIN_EVALUATIONS = 240
+SWITCH_MIN_REL_IMPROVEMENT = 0.003
+SWITCH_REEVAL_ELITES_TOP_K = 12
 
 # Індекс файлів для прискорення старту.
 # Якщо True і файл індексу існує, скрипт не робить повний scan кожен раз.
@@ -106,7 +103,7 @@ USE_COMPACT_ITERATION_NAMES = True
 
 # Додатковий post-step після тюнінгу:
 # для топ-N кандидатів створити повний пакет візуалізацій як у main.py.
-GENERATE_FULL_VISUALS_FOR_TOP_N = 10
+GENERATE_FULL_VISUALS_FOR_TOP_N = 2
 
 # Куди складати purity-артефакти під час ітеративного пошуку.
 # Важливо: це окрема папка, щоб `viz/` містив тільки візуалізації.
@@ -123,42 +120,87 @@ TUNING_DIR_BASENAME = "_tuning"
 #           + w_nn_excess * max(0, max_nn_cross_ratio - threshold_max_nn)
 #           + w_sil_deficit * max(0, threshold_min_silhouette - silhouette)
 #
-# Інтуїтивно:
-# - менші max_centroid_cosine/max_nn_cross_ratio покращують score;
-# - більший silhouette покращує score;
-# - якщо метрика виходить за поріг purity, додається м'який штраф, а не жорстке відсікання.
-SCORE_WEIGHT_MAX_COS = 1.0
-SCORE_WEIGHT_MAX_NN = 0.7
-SCORE_WEIGHT_SILHOUETTE = 0.4
-SCORE_WEIGHT_COS_EXCESS = 1.5
-SCORE_WEIGHT_NN_EXCESS = 1.2
+# ==============================================================================
+# КОМПОЗИТНИЙ SCORE (ФІТНЕС-ФУНКЦІЯ ЕВОЛЮЦІЇ)
+# ==============================================================================
+# Мета генетичного алгоритму — ЗМІНІМІЗУВАТИ цей score. Чим менше значення, тим краще.
+# Формула: Score = (Базова оцінка якості) + (Штрафи за порушення порогів Purity)
+# 
+# Чому використовуються "м'які штрафи" (Soft Penalties), а не жорстке відсікання?
+# Якщо особина має max_cos = 0.966 (ледь порушила поріг 0.965), але при цьому 
+# ідеальний silhouette (0.6), ми не хочемо її вбивати. Її "гени" (параметри) дуже
+# цінні для популяції. Штраф просто опустить її в рейтингу, але залишить для мутацій.
+# ==============================================================================
+
+# --- БАЗОВІ ВАГИ (Вплив на рейтинг у межах норми) ---
+
+# SCORE_WEIGHT_MAX_COS: Найвищий пріоритет (1.15). 
+# Косинусна подібність центроїдів напряму відповідає за ризик витоку даних (Data Leakage). 
+# Чим нижчий max_cos, тим далі пресети один від одного семантично. 
+# Алгоритм має фокусуватися на мінімізації саме цього показника.
+SCORE_WEIGHT_MAX_COS = 1.15
+
+# SCORE_WEIGHT_MAX_NN: Середній пріоритет (0.75). 
+# Оцінює "шорсткість" кордонів між кластерами. Якщо точки одного пресету 
+# фізично знаходяться поруч із точками іншого пресету в просторі UMAP, це погано, 
+# але менш критично, ніж глобальна схожість центроїдів.
+SCORE_WEIGHT_MAX_NN = 0.75
+
+# SCORE_WEIGHT_SILHOUETTE: Найнижчий пріоритет (0.25). 
+# Silhouette оцінює математичну щільність "кульок" кластерів. 
+# Ми ставимо низьку вагу, бо для нас ізоляція пресетів набагато важливіша 
+# за красиву математичну форму кластера. 
+# (Примітка: оскільки більший silhouette — це краще, у формулі він віднімається).
+SCORE_WEIGHT_SILHOUETTE = 0.25
+
+
+# --- ВАГИ ШТРАФІВ (Вмикаються тільки при порушенні порогів з config.yaml) ---
+
+# SCORE_WEIGHT_COS_EXCESS: Дуже жорсткий штраф (2.2).
+# Якщо косинусна подібність пробиває поріг (напр. > 0.965), це означає, що 
+# алгоритм створив відверті дублікати локацій. Цей множник стрімко запускає 
+# score в космос, щоб еволюція "тікала" від таких параметрів.
+SCORE_WEIGHT_COS_EXCESS = 2.2
+
+# SCORE_WEIGHT_NN_EXCESS: Помірний штраф (1.5).
+# Якщо перетік точок (kNN cross-ratio) перевищує ліміт, ми штрафуємо конфігурацію, 
+# бо вона, ймовірно, неправильно розрізала один великий пресет на шматки.
+SCORE_WEIGHT_NN_EXCESS = 1.5
+
+# SCORE_WEIGHT_SIL_DEFICIT: М'який штраф (1.0).
+# Якщо кластери вийшли занадто пухкими (silhouette < 0.25), ми накладаємо 
+# легкий штраф. Це не так критично, як дублікати локацій, але свідчить 
+# про високий рівень шуму.
 SCORE_WEIGHT_SIL_DEFICIT = 1.0
 
 # ==========================
-# GRID SEARCH (БАГАТО ІТЕРАЦІЙ)
+# SEARCH SPACE (ЕВОЛЮЦІЙНИЙ ПОШУК)
 # ==========================
 SEARCH_SPACE = {
     # reduction.*
     # Ключі мають формат "section.param" і АВТОМАТИЧНО мапляться в dataclass секції конфіга.
     # Тобто можна додавати будь-який валідний параметр з config-схеми:
     #   "reduction.*", "clustering.*", "purity.*" (і за потреби інші секції, якщо підтримає оцінка).
-    "reduction.umap_components": [3, 4, 5],
-    "reduction.umap_n_neighbors": [30, 45, 60, 80],
+
+    # pca.*
+    "reduction.pca_components": [50, 100, 150, 250, 400],
+
+    # umap.*
+    
+    "reduction.umap_components": [3, 4, 5, 6, 8, 10],
+    "reduction.umap_n_neighbors": [15, 30, 45, 60, 80, 100, 120, 150, 200],    
     "reduction.umap_min_dist": [0.0],
+
     # clustering.*
-    "clustering.min_cluster_size": [300, 400, 500],
-    "clustering.min_samples": [3, 5, 8, 12, 16],
-    "clustering.cluster_selection_epsilon": [0.2, 0.4, 0.6, 0.9, 1.2, 1.6],
-    "clustering.cluster_selection_method": ["leaf", "eom"],
+    "clustering.min_cluster_size": [300, 450, 600, 800, 1000],
+    "clustering.min_samples": [3, 5, 8, 12, 16, 24],
+    "clustering.cluster_selection_epsilon": [0.3, 0.6, 0.9, 1.2, 1.6, 2.0],
+    "clustering.cluster_selection_method": ["eom"],
+
     # purity.* (за потреби можна тюнити пороги теж)
     # Наприклад:
     # "purity.max_nn_cross_ratio": [0.4, 0.5, 0.6],
 }
-
-# Повний grid за замовчуванням: 3*4*1*6*5*6*2 = 4320 комбінацій.
-# За замовчуванням беремо репрезентативну підмножину для "нічного" прогона.
-DEFAULT_MAX_TRIALS = GRID_MAX_TRIALS
-
 
 def _json_ready(value):
     if isinstance(value, Path):
@@ -199,9 +241,10 @@ def _tuner_settings_snapshot() -> dict:
         "EARLY_STOP_MIN_EVALUATIONS": EARLY_STOP_MIN_EVALUATIONS,
         "TWO_PHASE_ENABLED": TWO_PHASE_ENABLED,
         "PHASE1_FRACTION": PHASE1_FRACTION,
-        "PHASE1_BUDGET_RATIO": PHASE1_BUDGET_RATIO,
-        "PHASE2_TOP_K_SEEDS": PHASE2_TOP_K_SEEDS,
-        "GRID_MAX_TRIALS": GRID_MAX_TRIALS,
+        "SWITCH_PATIENCE_GENERATIONS": SWITCH_PATIENCE_GENERATIONS,
+        "SWITCH_MIN_EVALUATIONS": SWITCH_MIN_EVALUATIONS,
+        "SWITCH_MIN_REL_IMPROVEMENT": SWITCH_MIN_REL_IMPROVEMENT,
+        "SWITCH_REEVAL_ELITES_TOP_K": SWITCH_REEVAL_ELITES_TOP_K,
         "REUSE_IMAGE_INDEX": REUSE_IMAGE_INDEX,
         "IMAGE_INDEX_FILENAME": IMAGE_INDEX_FILENAME,
         "FORCE_RESCAN": FORCE_RESCAN,
@@ -222,7 +265,6 @@ def _tuner_settings_snapshot() -> dict:
             "SCORE_WEIGHT_SIL_DEFICIT": SCORE_WEIGHT_SIL_DEFICIT,
         },
         "SEARCH_SPACE": SEARCH_SPACE,
-        "DEFAULT_MAX_TRIALS": DEFAULT_MAX_TRIALS,
     }
 
 
@@ -238,52 +280,6 @@ def _runtime_config_snapshot(cfg) -> dict:
         "clustering": cfg.clustering,
         "purity": cfg.purity,
     }
-
-
-def _build_iterations(max_trials: int) -> list[dict]:
-    keys = list(SEARCH_SPACE.keys())
-    values_grid = [SEARCH_SPACE[k] for k in keys]
-    all_combos = []
-    for idx, combo in enumerate(product(*values_grid), 1):
-        flat = dict(zip(keys, combo))
-        overrides: dict = {}
-        for dotted_key, value in flat.items():
-            section, param = dotted_key.split(".", 1)
-            overrides.setdefault(section, {})
-            overrides[section][param] = value
-
-        if USE_COMPACT_ITERATION_NAMES:
-            name = f"iter_{idx:04d}"
-        else:
-            # Формуємо стабільну назву з токенами параметрів.
-            tokens = []
-            for dotted_key in keys:
-                section, param = dotted_key.split(".", 1)
-                value = flat[dotted_key]
-                short = param.replace("cluster_selection_", "csel_").replace("_", "")
-                val_s = str(value).replace(".", "_")
-                tokens.append(f"{section[0]}{short}{val_s}")
-            name = f"iter_{idx:04d}_" + "_".join(tokens[:6])
-
-        all_combos.append(
-            {
-                "name": name,
-                "overrides": overrides,
-            }
-        )
-
-    if max_trials <= 0 or max_trials >= len(all_combos):
-        return all_combos
-
-    # Рівномірно розкладаємо вибірку по всьому простору параметрів.
-    selected = []
-    used = set()
-    for i in range(max_trials):
-        pos = round(i * (len(all_combos) - 1) / (max_trials - 1))
-        if pos not in used:
-            used.add(pos)
-            selected.append(all_combos[pos])
-    return selected
 
 
 def _space_keys() -> list[str]:
@@ -318,6 +314,13 @@ def _candidate_name(prefix: str, idx: int, flat: dict, keys: list[str]) -> str:
 
 def _random_flat_candidate(rng: random.Random, keys: list[str]) -> dict:
     return {k: rng.choice(SEARCH_SPACE[k]) for k in keys}
+
+
+def _search_space_size(keys: list[str]) -> int:
+    total = 1
+    for k in keys:
+        total *= max(0, len(SEARCH_SPACE.get(k, [])))
+    return total
 
 
 def _tournament_pick(rng: random.Random, pool: list[dict], k: int) -> dict:
@@ -456,6 +459,7 @@ def _evaluate_iteration(
     flat_candidate: dict,
     name: str,
     force_full_logs: bool = False,
+    eval_scope: str = "full",
 ):
     overrides = _flat_to_overrides(flat_candidate)
     red_over = overrides.get("reduction", {})
@@ -543,6 +547,7 @@ def _evaluate_iteration(
         "status": "ok",
         "thresholds": thresholds,
         "iteration_config_path": str(iteration_cfg_path),
+        "eval_scope": eval_scope,
     }
     score, score_parts = _compute_dynamic_score(row)
     row["score"] = score
@@ -562,25 +567,70 @@ def _save_tuning_plots(summary_dir: Path, results: list[dict], top_results: list
     if not ok_results:
         return created
 
+    plt.style.use("seaborn-v0_8-whitegrid")
+
     # 1) Progress plot over evaluation index.
     eval_x = list(range(1, len(ok_results) + 1))
     max_cos = [r["max_centroid_cosine"] for r in ok_results]
     silhouette = [r["silhouette"] for r in ok_results]
     max_nn = [r["max_nn_cross_ratio"] for r in ok_results]
+    scopes = [r.get("eval_scope", "full") for r in ok_results]
+    switch_eval_idx = None
+    for i, scope in enumerate(scopes, 1):
+        if scope == "full":
+            switch_eval_idx = i
+            break
+
+    def _best_so_far(vals, lower_is_better: bool):
+        best = []
+        cur = None
+        for v in vals:
+            if v is None:
+                best.append(cur)
+                continue
+            if cur is None:
+                cur = v
+            elif lower_is_better and v < cur:
+                cur = v
+            elif (not lower_is_better) and v > cur:
+                cur = v
+            best.append(cur)
+        return best
+
+    best_max_cos = _best_so_far(max_cos, lower_is_better=True)
+    best_sil = _best_so_far(silhouette, lower_is_better=False)
+    best_max_nn = _best_so_far(max_nn, lower_is_better=True)
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
-    axes[0].plot(eval_x, max_cos, marker="o", markersize=2, linewidth=1)
+    axes[0].plot(eval_x, max_cos, marker="o", markersize=3, linewidth=1.2, label="raw")
+    axes[0].plot(eval_x, best_max_cos, linestyle="--", linewidth=1.1, label="best-so-far")
     axes[0].set_ylabel("max_centroid_cosine")
+    axes[0].legend(loc="upper right", fontsize=8)
     axes[0].grid(alpha=0.3)
 
-    axes[1].plot(eval_x, silhouette, marker="o", markersize=2, linewidth=1, color="tab:orange")
+    axes[1].plot(eval_x, silhouette, marker="o", markersize=3, linewidth=1.2, color="tab:orange", label="raw")
+    axes[1].plot(eval_x, best_sil, linestyle="--", linewidth=1.1, color="tab:brown", label="best-so-far")
     axes[1].set_ylabel("silhouette")
+    axes[1].legend(loc="upper right", fontsize=8)
     axes[1].grid(alpha=0.3)
 
-    axes[2].plot(eval_x, max_nn, marker="o", markersize=2, linewidth=1, color="tab:green")
+    axes[2].plot(eval_x, max_nn, marker="o", markersize=3, linewidth=1.2, color="tab:green", label="raw")
+    axes[2].plot(eval_x, best_max_nn, linestyle="--", linewidth=1.1, color="tab:olive", label="best-so-far")
     axes[2].set_ylabel("max_nn_cross_ratio")
     axes[2].set_xlabel("Successful evaluation #")
+    axes[2].legend(loc="upper right", fontsize=8)
     axes[2].grid(alpha=0.3)
+
+    if switch_eval_idx is not None and switch_eval_idx > 1:
+        for ax in axes:
+            ax.axvline(switch_eval_idx, color="tab:purple", linestyle=":", linewidth=1.3)
+            ax.text(
+                switch_eval_idx + 0.2,
+                ax.get_ylim()[1] - (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.08,
+                "switch->full",
+                color="tab:purple",
+                fontsize=8,
+            )
 
     fig.suptitle("Tuning Progress")
     fig.tight_layout()
@@ -591,12 +641,12 @@ def _save_tuning_plots(summary_dir: Path, results: list[dict], top_results: list
 
     # 2) Top-20 max_cos + silhouettes.
     top_n = top_results[:20]
-    names = [r["name"][-24:] for r in top_n]
+    names = [r["name"][-28:] for r in top_n]
     cos_vals = [r["max_centroid_cosine"] for r in top_n]
     sil_vals = [r["silhouette"] if r["silhouette"] is not None else 0.0 for r in top_n]
 
-    fig, ax1 = plt.subplots(figsize=(14, 6))
-    bars = ax1.bar(range(len(top_n)), cos_vals, color="tab:red", alpha=0.75)
+    fig, ax1 = plt.subplots(figsize=(14, 7))
+    bars = ax1.bar(range(len(top_n)), cos_vals, color="tab:red", alpha=0.72)
     ax1.set_ylabel("max_centroid_cosine", color="tab:red")
     ax1.tick_params(axis="y", labelcolor="tab:red")
     ax1.set_xticks(range(len(top_n)))
@@ -608,11 +658,11 @@ def _save_tuning_plots(summary_dir: Path, results: list[dict], top_results: list
     ax2.set_ylabel("silhouette", color="tab:blue")
     ax2.tick_params(axis="y", labelcolor="tab:blue")
 
-    for b, v in zip(bars, cos_vals):
+    for i, (b, v) in enumerate(zip(bars, cos_vals), 1):
         ax1.text(
             b.get_x() + b.get_width() / 2,
             v + 0.002,
-            f"{v:.3f}",
+            f"#{i} {v:.3f}",
             ha="center",
             va="bottom",
             fontsize=7,
@@ -635,6 +685,7 @@ def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
         "section",
         "rank",
         "name",
+        "eval_scope",
         "score",
         "status",
         "checks_passed",
@@ -659,6 +710,7 @@ def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
                     "section": "all",
                     "rank": "",
                     "name": row.get("name", ""),
+                    "eval_scope": row.get("eval_scope", ""),
                     "score": row.get("score"),
                     "status": row.get("status", ""),
                     "checks_passed": row.get("checks_passed", False),
@@ -676,7 +728,9 @@ def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
                 }
             )
         ok_results = [r for r in results if r.get("status") == "ok"]
-        top_sorted = sorted(ok_results, key=_score_for_sort)[:20]
+        full_ok_results = [r for r in ok_results if r.get("eval_scope") == "full"]
+        ranked_pool = full_ok_results if full_ok_results else ok_results
+        top_sorted = sorted(ranked_pool, key=_score_for_sort)[:20]
         writer.writerow({})
         for i, row in enumerate(top_sorted, 1):
             writer.writerow(
@@ -684,6 +738,7 @@ def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
                     "section": "top",
                     "rank": i,
                     "name": row.get("name", ""),
+                    "eval_scope": row.get("eval_scope", ""),
                     "score": row.get("score"),
                     "status": row.get("status", ""),
                     "checks_passed": row.get("checks_passed", False),
@@ -791,20 +846,31 @@ def _run_evolution_search(
     run_root: Path,
     keys: list[str],
     features,
+    full_features,
     max_trials: int,
     phase_tag: str,
     rng_seed: int,
-    initial_population: list[dict] | None = None,
 ):
     rng = random.Random(rng_seed)
     pop_size = EVOLUTION_POPULATION_SIZE
     elite_size = min(EVOLUTION_ELITE_SIZE, pop_size)
     tournament_size = EVOLUTION_TOURNAMENT_SIZE
     mutation_rate = EVOLUTION_MUTATION_RATE
+    use_subset_first = TWO_PHASE_ENABLED and PHASE1_FRACTION < 1.0
+    active_scope = "subset" if use_subset_first else "full"
+    switched_to_full = not use_subset_first
+    current_features = features if use_subset_first else full_features
 
     results = []
     evaluated_signatures = set()
     start_all = time.time()
+    total_unique = _search_space_size(keys)
+    if total_unique <= 0:
+        raise ValueError("SEARCH_SPACE порожній: немає кандидатів для еволюції.")
+    if pop_size > total_unique:
+        print(f"[WARN] population_size={pop_size} > search_space={total_unique}; cap до {total_unique}")
+        pop_size = total_unique
+        elite_size = min(elite_size, pop_size)
 
     def log_result(idx: int, total: int, row: dict, elapsed_iter: float):
         elapsed_all = time.time() - start_all
@@ -812,9 +878,17 @@ def _run_evolution_search(
         eta = avg_iter * max(0, total - idx)
         eta_h = int(eta // 3600)
         eta_m = int((eta % 3600) // 60)
+        scope = row.get("eval_scope", "full")
+        if scope == "subset":
+            scope_label = f"subset({PHASE1_FRACTION*100:.1f}%)"
+        elif scope == "full":
+            scope_label = "full(100%)"
+        else:
+            scope_label = str(scope)
         if row["status"] == "ok":
             print(
                 "  RESULT:",
+                f"data={scope_label},",
                 f"score={row.get('score', float('nan')):.4f},",
                 f"checks={row.get('checks_passed', False)},",
                 f"verdict={row['verdict']},",
@@ -831,34 +905,34 @@ def _run_evolution_search(
             print(
                 "  RESULT:",
                 "ERROR,",
+                f"data={scope_label},",
                 row["status"],
                 f"time={elapsed_iter:.1f}s,",
                 f"ETA~{eta_h:02d}:{eta_m:02d}",
             )
 
     population = []
-    if initial_population:
-        for cand in initial_population:
-            sig = _candidate_signature(cand, keys)
-            if sig in evaluated_signatures:
-                continue
-            evaluated_signatures.add(sig)
-            population.append(dict(cand))
-            if len(population) >= pop_size:
-                break
-
-    while len(population) < pop_size:
+    attempts = 0
+    max_attempts = max(1000, pop_size * 100)
+    while len(population) < pop_size and attempts < max_attempts:
+        attempts += 1
         cand = _random_flat_candidate(rng, keys)
         sig = _candidate_signature(cand, keys)
         if sig in evaluated_signatures:
             continue
         evaluated_signatures.add(sig)
         population.append(cand)
+    if len(population) < pop_size:
+        raise RuntimeError(
+            f"Не вдалося зібрати початкову популяцію: {len(population)}/{pop_size}. "
+            "Перевір SEARCH_SPACE."
+        )
 
     eval_count = 0
     generation = 0
     stagnation_generations = 0
     best_score = None
+    best_score_history = []
 
     while eval_count < max_trials:
         generation += 1
@@ -885,10 +959,11 @@ def _run_evolution_search(
                 row = _evaluate_iteration(
                     cfg,
                     run_root,
-                    features,
+                    current_features,
                     cand,
                     name,
                     force_full_logs=detailed_now,
+                    eval_scope=active_scope,
                 )
             except Exception as exc:
                 row = {
@@ -906,6 +981,7 @@ def _run_evolution_search(
                     "status": f"error: {type(exc).__name__}: {exc}",
                     "score": None,
                     "iteration_config_path": "",
+                    "eval_scope": active_scope,
                 }
 
             elapsed_iter = time.time() - t_iter
@@ -927,6 +1003,107 @@ def _run_evolution_search(
             stagnation_generations = 0
         else:
             stagnation_generations += 1
+        if best_score is not None:
+            best_score_history.append(best_score[0])
+
+        can_switch = (
+            (not switched_to_full)
+            and eval_count >= SWITCH_MIN_EVALUATIONS
+            and len(best_score_history) >= SWITCH_PATIENCE_GENERATIONS + 1
+        )
+        slow_improvement = False
+        if can_switch:
+            prev_best = best_score_history[-(SWITCH_PATIENCE_GENERATIONS + 1)]
+            curr_best = best_score_history[-1]
+            rel_gain = (prev_best - curr_best) / max(abs(prev_best), 1e-9)
+            slow_improvement = rel_gain < SWITCH_MIN_REL_IMPROVEMENT
+            if stagnation_generations >= SWITCH_PATIENCE_GENERATIONS or slow_improvement:
+                print("\n" + "#" * 72)
+                print(
+                    "ADAPTIVE SWITCH: subset -> full "
+                    f"(stagnation={stagnation_generations}, rel_gain={rel_gain:.4f})"
+                )
+                print("#" * 72)
+
+                ranked = sorted(ok_pool, key=_score_for_sort) if ok_pool else []
+                elites = ranked[: max(1, min(elite_size, SWITCH_REEVAL_ELITES_TOP_K))]
+                reevaluated = []
+                current_features = full_features
+                active_scope = "full"
+                switched_to_full = True
+
+                for elite in elites:
+                    if eval_count >= max_trials:
+                        break
+                    eval_count += 1
+                    t_iter = time.time()
+                    elite_flat = dict(elite["flat_params"])
+                    name = _candidate_name(f"evo_{phase_tag.lower()}_fullseed", eval_count, elite_flat, keys)
+                    print("\n" + "-" * 72)
+                    print(f"[{eval_count}/{max_trials}] {name} (re-eval elite on full)")
+                    try:
+                        row = _evaluate_iteration(
+                            cfg,
+                            run_root,
+                            current_features,
+                            elite_flat,
+                            name,
+                            force_full_logs=False,
+                            eval_scope="full",
+                        )
+                    except Exception as exc:
+                        row = {
+                            "name": name,
+                            "verdict": "N/A",
+                            "checks_passed": False,
+                            "n_clusters": -1,
+                            "max_centroid_cosine": None,
+                            "silhouette": None,
+                            "max_nn_cross_ratio": None,
+                            "leakage_candidates": -1,
+                            "report_path": "",
+                            "params": _flat_to_overrides(elite_flat),
+                            "flat_params": elite_flat,
+                            "status": f"error: {type(exc).__name__}: {exc}",
+                            "score": None,
+                            "iteration_config_path": "",
+                            "eval_scope": "full",
+                        }
+                    elapsed_iter = time.time() - t_iter
+                    row["elapsed_sec"] = round(elapsed_iter, 4)
+                    results.append(row)
+                    reevaluated.append(row)
+                    log_result(eval_count, max_trials, row, elapsed_iter)
+
+                reevaluated_ok = [r for r in reevaluated if r["status"] == "ok"]
+                if reevaluated_ok:
+                    best_score = min(reevaluated_ok, key=_score_for_sort)
+                    best_score = _score_for_sort(best_score)
+                    best_score_history = [best_score[0]]
+                    seeds = [dict(r["flat_params"]) for r in sorted(reevaluated_ok, key=_score_for_sort)[:elite_size]]
+                    population = []
+                    for seed in seeds:
+                        if len(population) >= pop_size:
+                            break
+                        population.append(seed)
+                    refill_attempts = 0
+                    refill_max_attempts = max(1000, pop_size * 100)
+                    while (
+                        len(population) < pop_size
+                        and len(evaluated_signatures) < total_unique
+                        and refill_attempts < refill_max_attempts
+                    ):
+                        refill_attempts += 1
+                        cand = _random_flat_candidate(rng, keys)
+                        sig = _candidate_signature(cand, keys)
+                        if sig in evaluated_signatures:
+                            continue
+                        evaluated_signatures.add(sig)
+                        population.append(cand)
+                stagnation_generations = 0
+                if eval_count >= max_trials:
+                    break
+                continue
 
         if (
             EARLY_STOP_ENABLED
@@ -944,13 +1121,23 @@ def _run_evolution_search(
 
         if not ok_pool:
             population = []
-            while len(population) < pop_size:
+            refill_attempts = 0
+            refill_max_attempts = max(1000, pop_size * 100)
+            while (
+                len(population) < pop_size
+                and len(evaluated_signatures) < total_unique
+                and refill_attempts < refill_max_attempts
+            ):
+                refill_attempts += 1
                 cand = _random_flat_candidate(rng, keys)
                 sig = _candidate_signature(cand, keys)
                 if sig in evaluated_signatures:
                     continue
                 evaluated_signatures.add(sig)
                 population.append(cand)
+            if len(population) < pop_size:
+                print("[WARN] Простір кандидатів вичерпано; завершуємо еволюцію.")
+                break
             continue
 
         ranked = sorted(ok_pool, key=_score_for_sort)
@@ -973,7 +1160,14 @@ def _run_evolution_search(
             evaluated_signatures.add(sig)
             next_population.append(child)
 
-        while len(next_population) < pop_size and len(evaluated_signatures) < 100000:
+        refill_attempts = 0
+        refill_max_attempts = max(1000, pop_size * 120)
+        while (
+            len(next_population) < pop_size
+            and len(evaluated_signatures) < total_unique
+            and refill_attempts < refill_max_attempts
+        ):
+            refill_attempts += 1
             child = _random_flat_candidate(rng, keys)
             sig = _candidate_signature(child, keys)
             if sig in evaluated_signatures:
@@ -981,6 +1175,8 @@ def _run_evolution_search(
             evaluated_signatures.add(sig)
             next_population.append(child)
 
+        if len(next_population) < pop_size:
+            print("[WARN] Простір кандидатів майже вичерпано; зменшуємо популяцію наступного покоління.")
         population = next_population
 
     return results
@@ -989,7 +1185,6 @@ def _run_evolution_search(
 def main() -> None:
     config_path = BASE_CONFIG_PATH
     max_trials = MAX_EVALUATIONS
-    strategy = SEARCH_STRATEGY.lower().strip()
 
     cfg = load_config(config_path)
     keys = _space_keys()
@@ -1003,9 +1198,9 @@ def main() -> None:
     print(f"Input:   {cfg.input_dir}")
     print(f"Output:  {cfg.output_dir}")
     print(f"Run root: {run_root}")
-    print(f"Strategy: {strategy}")
+    print(f"Strategy: {SEARCH_STRATEGY}")
     print(f"Max evaluations: {max_trials}")
-    print(f"Two-phase: {TWO_PHASE_ENABLED} (phase1_fraction={PHASE1_FRACTION})")
+    print(f"Adaptive subset->full: {TWO_PHASE_ENABLED} (phase1_fraction={PHASE1_FRACTION})")
     print(f"Early stop: {EARLY_STOP_ENABLED}")
     print(f"Console verbosity: {CONSOLE_VERBOSITY}")
     print(f"Top full visualizations: {GENERATE_FULL_VISUALS_FOR_TOP_N}")
@@ -1038,150 +1233,31 @@ def main() -> None:
 
     print("\n[3/4] Ітеративний прогін конфігів...")
     results = []
-
-    if strategy == "grid":
-        evaluated_signatures = set()
-        start_all = time.time()
-
-        def log_result(idx: int, total: int, row: dict, elapsed_iter: float):
-            elapsed_all = time.time() - start_all
-            avg_iter = elapsed_all / max(1, idx)
-            eta = avg_iter * max(0, total - idx)
-            eta_h = int(eta // 3600)
-            eta_m = int((eta % 3600) // 60)
-
-            if row["status"] == "ok":
-                print(
-                    "  RESULT:",
-                    f"score={row.get('score', float('nan')):.4f},",
-                    f"checks={row.get('checks_passed', False)},",
-                    f"verdict={row['verdict']},",
-                    f"clusters={row['n_clusters']},",
-                    f"max_cos={row['max_centroid_cosine']:.4f},",
-                    f"sil={row['silhouette'] if row['silhouette'] is not None else 'n/a'},",
-                    f"max_nn={row['max_nn_cross_ratio']:.4f},",
-                    f"leaks={row['leakage_candidates']},",
-                    f"warns={row.get('warn_count', 0)},",
-                    f"time={elapsed_iter:.1f}s,",
-                    f"ETA~{eta_h:02d}:{eta_m:02d}",
-                )
-            else:
-                print(
-                    "  RESULT:",
-                    "ERROR,",
-                    row["status"],
-                    f"time={elapsed_iter:.1f}s,",
-                    f"ETA~{eta_h:02d}:{eta_m:02d}",
-                )
-
-        iterations = _build_iterations(DEFAULT_MAX_TRIALS)
-        total = min(len(iterations), max_trials)
-        for idx, it in enumerate(iterations[:total], 1):
-            t_iter = time.time()
-            name = it["name"]
-            flat = {}
-            for section, params in it.get("overrides", {}).items():
-                for key, value in params.items():
-                    flat[f"{section}.{key}"] = value
-            sig = _candidate_signature(flat, keys)
-            if sig in evaluated_signatures:
-                continue
-            evaluated_signatures.add(sig)
-
-            print("\n" + "-" * 72)
-            print(f"[{idx}/{total}] {name}")
-            detailed_now = idx <= DETAILED_FIRST_N_ITERS
-            if detailed_now and CONSOLE_VERBOSITY == "compact":
-                print("  [detail] expanded logs enabled for warmup iteration")
-            if SHOW_OVERRIDES_EACH_ITER or detailed_now:
-                print(f"  overrides: {it.get('overrides', {})}")
-            try:
-                row = _evaluate_iteration(
-                    cfg,
-                    run_root,
-                    features,
-                    flat,
-                    name,
-                    force_full_logs=detailed_now,
-                )
-            except Exception as exc:
-                row = {
-                    "name": name,
-                    "verdict": "N/A",
-                    "checks_passed": False,
-                    "n_clusters": -1,
-                    "max_centroid_cosine": None,
-                    "silhouette": None,
-                    "max_nn_cross_ratio": None,
-                    "leakage_candidates": -1,
-                    "report_path": "",
-                    "params": it.get("overrides", {}),
-                    "flat_params": flat,
-                    "status": f"error: {type(exc).__name__}: {exc}",
-                    "score": None,
-                    "iteration_config_path": "",
-                }
-            elapsed_iter = time.time() - t_iter
-            row["elapsed_sec"] = round(elapsed_iter, 4)
-            results.append(row)
-            log_result(idx, total, row, elapsed_iter)
-    elif strategy == "evolution":
-        if TWO_PHASE_ENABLED:
-            phase1_budget = max(1, int(max_trials * PHASE1_BUDGET_RATIO))
-            phase2_budget = max_trials - phase1_budget
-
-            print("\n" + "#" * 72)
-            print(f"PHASE 1: subset {PHASE1_FRACTION*100:.1f}% | budget={phase1_budget}")
-            print("#" * 72)
-            features_phase1, _ = _subsample_features(
-                features, PHASE1_FRACTION, EVOLUTION_RANDOM_SEED
-            )
-            phase1_results = _run_evolution_search(
-                cfg=cfg,
-                run_root=run_root,
-                keys=keys,
-                features=features_phase1,
-                max_trials=phase1_budget,
-                phase_tag="PHASE1",
-                rng_seed=EVOLUTION_RANDOM_SEED,
-            )
-            results.extend(phase1_results)
-
-            phase1_ok = [r for r in phase1_results if r["status"] == "ok"]
-            seeds = []
-            if phase1_ok:
-                phase1_sorted = sorted(phase1_ok, key=_score_for_sort)
-                for row in phase1_sorted[:PHASE2_TOP_K_SEEDS]:
-                    seeds.append(dict(row["flat_params"]))
-
-            if phase2_budget > 0:
-                print("\n" + "#" * 72)
-                print(f"PHASE 2: full dataset 100% | budget={phase2_budget}")
-                print("#" * 72)
-                phase2_results = _run_evolution_search(
-                    cfg=cfg,
-                    run_root=run_root,
-                    keys=keys,
-                    features=features,
-                    max_trials=phase2_budget,
-                    phase_tag="PHASE2",
-                    rng_seed=EVOLUTION_RANDOM_SEED + 1,
-                    initial_population=seeds,
-                )
-                results.extend(phase2_results)
-        else:
-            phase_results = _run_evolution_search(
-                cfg=cfg,
-                run_root=run_root,
-                keys=keys,
-                features=features,
-                max_trials=max_trials,
-                phase_tag="PHASE1",
-                rng_seed=EVOLUTION_RANDOM_SEED,
-            )
-            results.extend(phase_results)
+    features_subset = features
+    if TWO_PHASE_ENABLED and PHASE1_FRACTION < 1.0:
+        features_subset, _ = _subsample_features(features, PHASE1_FRACTION, EVOLUTION_RANDOM_SEED)
+        print("\n" + "#" * 72)
+        print(
+            f"ADAPTIVE START: subset {PHASE1_FRACTION*100:.1f}% -> full 100% "
+            "on plateau/slow-improvement"
+        )
+        print("#" * 72)
     else:
-        raise ValueError("SEARCH_STRATEGY має бути 'grid' або 'evolution'")
+        print("\n" + "#" * 72)
+        print("ADAPTIVE START: full 100% from first generation")
+        print("#" * 72)
+
+    phase_results = _run_evolution_search(
+        cfg=cfg,
+        run_root=run_root,
+        keys=keys,
+        features=features_subset,
+        full_features=features,
+        max_trials=max_trials,
+        phase_tag="EVOLVE",
+        rng_seed=EVOLUTION_RANDOM_SEED,
+    )
+    results.extend(phase_results)
 
     print("\n[4/4] Підсумок")
     print("-" * 72)
@@ -1190,7 +1266,12 @@ def main() -> None:
         print("Не вдалося завершити жодної ітерації успішно.")
         return
 
-    results_sorted = sorted(ok_results, key=_score_for_sort)
+    full_ok_results = [r for r in ok_results if r.get("eval_scope") == "full"]
+    if full_ok_results:
+        results_sorted = sorted(full_ok_results, key=_score_for_sort)
+    else:
+        print("  [WARN] Немає full-evals, fallback на всі успішні ітерації.")
+        results_sorted = sorted(ok_results, key=_score_for_sort)
     for i, r in enumerate(results_sorted, 1):
         print(
             f"{i:>2}. {r['name']:<22} "
@@ -1218,9 +1299,10 @@ def main() -> None:
     summary_path = summary_dir / "tuning_summary_latest.json"
     summary = {
         "config_path": config_path,
-        "strategy": strategy,
+        "strategy": SEARCH_STRATEGY,
         "total_trials_requested": max_trials,
         "total_trials_ok": len(ok_results),
+        "total_trials_ok_full": len(full_ok_results),
         "best": best,
         "top20": results_sorted[:20],
         "all_results": results,
