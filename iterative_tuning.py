@@ -43,7 +43,7 @@ SEARCH_STRATEGY = "evolution"
 
 # Бюджет запусків (максимум реальних expensive-eval)
 # Це верхня межа кількості ПОВНИХ оцінок (reduce + cluster + purity) за запуск.
-MAX_EVALUATIONS = 24
+MAX_EVALUATIONS = 12000
 
 # Параметри еволюційного пошуку (μ + λ GA)
 # EVOLUTION_POPULATION_SIZE  -> розмір популяції в кожному поколінні.
@@ -94,7 +94,7 @@ CONSOLE_VERBOSITY = "compact"
 SHOW_OVERRIDES_EACH_ITER = False
 SAVE_COMPACT_STDOUT_PER_ITER = False
 # Перші N ітерацій друкуються детально навіть у compact-режимі.
-DETAILED_FIRST_N_ITERS = 2
+DETAILED_FIRST_N_ITERS = 5
 
 # Короткі назви директорій ітерацій:
 # True  -> evo_phase2_0076
@@ -103,7 +103,7 @@ USE_COMPACT_ITERATION_NAMES = True
 
 # Додатковий post-step після тюнінгу:
 # для топ-N кандидатів створити повний пакет візуалізацій як у main.py.
-GENERATE_FULL_VISUALS_FOR_TOP_N = 2
+GENERATE_FULL_VISUALS_FOR_TOP_N = 20
 
 # Куди складати purity-артефакти під час ітеративного пошуку.
 # Важливо: це окрема папка, щоб `viz/` містив тільки візуалізації.
@@ -173,6 +173,19 @@ SCORE_WEIGHT_NN_EXCESS = 1.5
 # про високий рівень шуму.
 SCORE_WEIGHT_SIL_DEFICIT = 1.0
 
+# --- ADAPTIVE PENALTY (динамічне підсилення штрафів упродовж еволюції) ---
+#
+# Ідея: на старті пошуку (ранні покоління) дати більше свободи exploration,
+# тобто м'якше карати за порушення порогів purity. Далі поступово робити
+# штрафи жорсткішими, щоб еволюція концентрувалась на feasible-рішеннях (PASS).
+#
+# penalty_scale(generation) інтерполюється в діапазоні [START, END].
+# При POWER > 1 крива "пізнього посилення" (довше м'яко, потім різкіше).
+ADAPTIVE_PENALTY_ENABLED = True
+ADAPTIVE_PENALTY_START = 0.5
+ADAPTIVE_PENALTY_END = 3.0
+ADAPTIVE_PENALTY_POWER = 1.0
+
 # ==========================
 # SEARCH SPACE (ЕВОЛЮЦІЙНИЙ ПОШУК)
 # ==========================
@@ -186,7 +199,6 @@ SEARCH_SPACE = {
     "reduction.pca_components": [50, 100, 150, 250, 400],
 
     # umap.*
-    
     "reduction.umap_components": [3, 4, 5, 6, 8, 10],
     "reduction.umap_n_neighbors": [15, 30, 45, 60, 80, 100, 120, 150, 200],    
     "reduction.umap_min_dist": [0.0],
@@ -263,6 +275,12 @@ def _tuner_settings_snapshot() -> dict:
             "SCORE_WEIGHT_COS_EXCESS": SCORE_WEIGHT_COS_EXCESS,
             "SCORE_WEIGHT_NN_EXCESS": SCORE_WEIGHT_NN_EXCESS,
             "SCORE_WEIGHT_SIL_DEFICIT": SCORE_WEIGHT_SIL_DEFICIT,
+        },
+        "ADAPTIVE_PENALTY": {
+            "ADAPTIVE_PENALTY_ENABLED": ADAPTIVE_PENALTY_ENABLED,
+            "ADAPTIVE_PENALTY_START": ADAPTIVE_PENALTY_START,
+            "ADAPTIVE_PENALTY_END": ADAPTIVE_PENALTY_END,
+            "ADAPTIVE_PENALTY_POWER": ADAPTIVE_PENALTY_POWER,
         },
         "SEARCH_SPACE": SEARCH_SPACE,
     }
@@ -358,8 +376,14 @@ def _apply_section_overrides(base_cfg, overrides: dict):
     return cfg
 
 
-def _compute_dynamic_score(item: dict) -> tuple[float, dict]:
-    """Композитний score без жорсткого відсікання по verdict (менше = краще)."""
+def _compute_dynamic_score(item: dict, penalty_scale: float = 1.0) -> tuple[float, dict]:
+    """Обчислює objective + normalized constraint penalties.
+
+    Важливо:
+    1) objective (base) ранжує якість серед feasible-рішень.
+    2) cv_total (constraint violation) показує, наскільки сильно порушені пороги.
+    3) penalty_scale дозволяє плавно посилювати тиск на constraints упродовж еволюції.
+    """
     cos = item.get("max_centroid_cosine")
     sil = item.get("silhouette")
     nn = item.get("max_nn_cross_ratio")
@@ -367,10 +391,25 @@ def _compute_dynamic_score(item: dict) -> tuple[float, dict]:
 
     # Missing-метрики: великий штраф, але не краш ранжування.
     if cos is None or nn is None:
-        return 9999.0, {"reason": "missing_core_metrics"}
+        return 9999.0, {
+            "reason": "missing_core_metrics",
+            "base": 9999.0,
+            "objective_base": 9999.0,
+            "penalty": 0.0,
+            "penalty_scale": penalty_scale,
+            "cv_total": 9999.0,
+            "violation_count": 3,
+            "is_feasible": False,
+            "cos_excess": 9999.0,
+            "nn_excess": 9999.0,
+            "sil_deficit": 9999.0,
+            "cos_excess_rel": 9999.0,
+            "nn_excess_rel": 9999.0,
+            "sil_deficit_rel": 9999.0,
+        }
 
     sil_safe = sil if sil is not None else -1.0
-    base = (
+    objective_base = (
         SCORE_WEIGHT_MAX_COS * cos
         + SCORE_WEIGHT_MAX_NN * nn
         - SCORE_WEIGHT_SILHOUETTE * sil_safe
@@ -382,28 +421,67 @@ def _compute_dynamic_score(item: dict) -> tuple[float, dict]:
     cos_excess = max(0.0, cos - cos_thr)
     nn_excess = max(0.0, nn - nn_thr)
     sil_deficit = max(0.0, sil_thr - sil_safe)
+    cos_denom = max(1e-9, 1.0 - float(cos_thr))
+    nn_denom = max(1e-9, float(nn_thr))
+    sil_denom = max(1e-9, float(sil_thr) if sil_thr > 0 else 1.0)
+    cos_excess_rel = cos_excess / cos_denom
+    nn_excess_rel = nn_excess / nn_denom
+    sil_deficit_rel = sil_deficit / sil_denom
 
-    penalty = (
-        SCORE_WEIGHT_COS_EXCESS * cos_excess
-        + SCORE_WEIGHT_NN_EXCESS * nn_excess
-        + SCORE_WEIGHT_SIL_DEFICIT * sil_deficit
+    # Нормалізований агрегат порушень (constraint violation, CV).
+    cv_total = (
+        SCORE_WEIGHT_COS_EXCESS * cos_excess_rel
+        + SCORE_WEIGHT_NN_EXCESS * nn_excess_rel
+        + SCORE_WEIGHT_SIL_DEFICIT * sil_deficit_rel
     )
-    score = base + penalty
+    penalty = penalty_scale * cv_total
+    score = objective_base + penalty
+    violation_count = int(cos_excess > 0) + int(nn_excess > 0) + int(sil_deficit > 0)
+    is_feasible = violation_count == 0
     return score, {
-        "base": base,
+        "base": objective_base,
+        "objective_base": objective_base,
         "penalty": penalty,
+        "penalty_scale": penalty_scale,
+        "cv_total": cv_total,
+        "violation_count": violation_count,
+        "is_feasible": is_feasible,
         "cos_excess": cos_excess,
         "nn_excess": nn_excess,
         "sil_deficit": sil_deficit,
+        "cos_excess_rel": cos_excess_rel,
+        "nn_excess_rel": nn_excess_rel,
+        "sil_deficit_rel": sil_deficit_rel,
     }
 
 
 def _score_for_sort(item: dict) -> tuple:
-    """Менше значення -> кращий результат."""
+    """Deb-style сортування: feasible-first, then lower CV, then better objective.
+
+    Порядок ключів:
+    1) статус виконання (ok краще за error),
+    2) feasible (PASS/без порушень) краще за infeasible,
+    3) cv_total (менше порушення краще),
+    4) objective_base (якість серед feasible),
+    5) додаткові tie-breakers.
+    """
+    status_rank = 0 if item.get("status") == "ok" else 1
+    is_feasible = bool(item.get("is_feasible", False))
+    infeasible_rank = 0 if is_feasible else 1
+    cv_total = item.get("cv_total")
+    if cv_total is None:
+        cv_total = 9999.0
+    objective_base = item.get("objective_base")
+    if objective_base is None:
+        objective_base = 9999.0
     score = item.get("score")
     if score is None:
         score = 9999.0
     return (
+        status_rank,
+        infeasible_rank,
+        cv_total,
+        objective_base,
         score,
         item["max_centroid_cosine"] if item["max_centroid_cosine"] is not None else 999.0,
         -(item["silhouette"] if item["silhouette"] is not None else -999.0),
@@ -460,6 +538,7 @@ def _evaluate_iteration(
     name: str,
     force_full_logs: bool = False,
     eval_scope: str = "full",
+    penalty_scale: float = 1.0,
 ):
     overrides = _flat_to_overrides(flat_candidate)
     red_over = overrides.get("reduction", {})
@@ -549,9 +628,14 @@ def _evaluate_iteration(
         "iteration_config_path": str(iteration_cfg_path),
         "eval_scope": eval_scope,
     }
-    score, score_parts = _compute_dynamic_score(row)
+    score, score_parts = _compute_dynamic_score(row, penalty_scale=penalty_scale)
     row["score"] = score
     row["score_parts"] = score_parts
+    row["cv_total"] = score_parts.get("cv_total")
+    row["objective_base"] = score_parts.get("objective_base")
+    row["is_feasible"] = score_parts.get("is_feasible")
+    row["violation_count"] = score_parts.get("violation_count")
+    row["penalty_scale"] = score_parts.get("penalty_scale")
     return row
 
 
@@ -687,6 +771,11 @@ def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
         "name",
         "eval_scope",
         "score",
+        "objective_base",
+        "cv_total",
+        "violation_count",
+        "is_feasible",
+        "penalty_scale",
         "status",
         "checks_passed",
         "verdict",
@@ -712,6 +801,11 @@ def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
                     "name": row.get("name", ""),
                     "eval_scope": row.get("eval_scope", ""),
                     "score": row.get("score"),
+                    "objective_base": row.get("objective_base"),
+                    "cv_total": row.get("cv_total"),
+                    "violation_count": row.get("violation_count"),
+                    "is_feasible": row.get("is_feasible"),
+                    "penalty_scale": row.get("penalty_scale"),
                     "status": row.get("status", ""),
                     "checks_passed": row.get("checks_passed", False),
                     "verdict": row.get("verdict", ""),
@@ -740,6 +834,11 @@ def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
                     "name": row.get("name", ""),
                     "eval_scope": row.get("eval_scope", ""),
                     "score": row.get("score"),
+                    "objective_base": row.get("objective_base"),
+                    "cv_total": row.get("cv_total"),
+                    "violation_count": row.get("violation_count"),
+                    "is_feasible": row.get("is_feasible"),
+                    "penalty_scale": row.get("penalty_scale"),
                     "status": row.get("status", ""),
                     "checks_passed": row.get("checks_passed", False),
                     "verdict": row.get("verdict", ""),
@@ -871,6 +970,18 @@ def _run_evolution_search(
         print(f"[WARN] population_size={pop_size} > search_space={total_unique}; cap до {total_unique}")
         pop_size = total_unique
         elite_size = min(elite_size, pop_size)
+    max_generations_est = max(1, (max_trials + max(1, pop_size) - 1) // max(1, pop_size))
+
+    def _adaptive_penalty_scale(generation_idx: int) -> float:
+        """Коефіцієнт штрафу для поточного покоління (grow schedule)."""
+        if not ADAPTIVE_PENALTY_ENABLED:
+            return 1.0
+        if max_generations_est <= 1:
+            return ADAPTIVE_PENALTY_END
+        progress = (generation_idx - 1) / max(1, max_generations_est - 1)
+        progress = min(1.0, max(0.0, progress))
+        curved = progress ** max(1e-9, ADAPTIVE_PENALTY_POWER)
+        return ADAPTIVE_PENALTY_START + (ADAPTIVE_PENALTY_END - ADAPTIVE_PENALTY_START) * curved
 
     def log_result(idx: int, total: int, row: dict, elapsed_iter: float):
         elapsed_all = time.time() - start_all
@@ -885,11 +996,22 @@ def _run_evolution_search(
             scope_label = "full(100%)"
         else:
             scope_label = str(scope)
+        score_parts = row.get("score_parts", {}) if isinstance(row, dict) else {}
+        score_decomp = (
+            "loss=("
+            f"obj={score_parts.get('objective_base', 0.0):.4f},"
+            f"pen={score_parts.get('penalty', 0.0):.4f},"
+            f"cv={score_parts.get('cv_total', 0.0):.4f},"
+            f"viol={score_parts.get('violation_count', 0)},"
+            f"lam={score_parts.get('penalty_scale', 1.0):.2f}"
+            ")"
+        )
         if row["status"] == "ok":
             print(
                 "  RESULT:",
                 f"data={scope_label},",
                 f"score={row.get('score', float('nan')):.4f},",
+                f"{score_decomp},",
                 f"checks={row.get('checks_passed', False)},",
                 f"verdict={row['verdict']},",
                 f"clusters={row['n_clusters']},",
@@ -936,8 +1058,14 @@ def _run_evolution_search(
 
     while eval_count < max_trials:
         generation += 1
+        penalty_scale = _adaptive_penalty_scale(generation)
         print("\n" + "=" * 72)
         print(f"{phase_tag} | GENERATION {generation}")
+        print(
+            "Penalty schedule:",
+            f"lambda={penalty_scale:.3f}",
+            f"(adaptive={ADAPTIVE_PENALTY_ENABLED}, start={ADAPTIVE_PENALTY_START}, end={ADAPTIVE_PENALTY_END})",
+        )
         print("=" * 72)
 
         gen_rows = []
@@ -964,6 +1092,7 @@ def _run_evolution_search(
                     name,
                     force_full_logs=detailed_now,
                     eval_scope=active_scope,
+                    penalty_scale=penalty_scale,
                 )
             except Exception as exc:
                 row = {
@@ -982,6 +1111,7 @@ def _run_evolution_search(
                     "score": None,
                     "iteration_config_path": "",
                     "eval_scope": active_scope,
+                    "penalty_scale": penalty_scale,
                 }
 
             elapsed_iter = time.time() - t_iter
@@ -1050,6 +1180,7 @@ def _run_evolution_search(
                             name,
                             force_full_logs=False,
                             eval_scope="full",
+                            penalty_scale=penalty_scale,
                         )
                     except Exception as exc:
                         row = {
@@ -1068,6 +1199,7 @@ def _run_evolution_search(
                             "score": None,
                             "iteration_config_path": "",
                             "eval_scope": "full",
+                            "penalty_scale": penalty_scale,
                         }
                     elapsed_iter = time.time() - t_iter
                     row["elapsed_sec"] = round(elapsed_iter, 4)

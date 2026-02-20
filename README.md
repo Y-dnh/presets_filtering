@@ -533,7 +533,7 @@ python iterative_tuning.py
    - reduction (`PCA + UMAP`),
    - clustering (`HDBSCAN`),
    - purity-оцінка (`max_centroid_cosine`, `silhouette`, `max_nn_cross_ratio`),
-   - розрахунок підсумкового score для ранжування.
+   - розрахунок `objective`, `cv_total` та фінального `score`.
 4. Збереження артефактів і метрик ітерації.
 5. Оновлення глобального рейтингу (`best`, `top20`, `all_results`).
 6. Якщо увімкнено `GENERATE_FULL_VISUALS_FOR_TOP_N` — повторний повний прогін топ-кандидатів з усіма візуалізаціями.
@@ -548,7 +548,10 @@ python iterative_tuning.py
 
 Нотатка про критерії:
 - `verdict` у тюнері — діагностичний індикатор порогів purity.
-- ранжування кандидатів робиться за `score` (динамічний композит метрик + мʼякі штрафи за вихід за пороги).
+- ранжування кандидатів виконується за Deb-style правилами:
+  1) feasible (`PASS`) краще за infeasible (`FAIL`),
+  2) серед infeasible — менший `cv_total` краще,
+  3) далі tie-break за `objective` і `score`.
 - runtime-помилки ітерацій позначаються окремо (`status=error`, `verdict=N/A`).
 
 Що можна тюнити:
@@ -605,20 +608,44 @@ python iterative_tuning.py
 - `score`:
   - композитний показник для ранжування кандидатів;
   - **менше = краще**;
-  - враховує три метрики і мʼяко штрафує перевищення/недобір порогів.
+  - включає базовий `objective` і штраф за `cv_total`.
+- `cv_total`:
+  - нормалізований агрегат порушень порогів purity;
+  - **менше = краще**;
+  - `0.0` означає, що кандидат feasible (пороги виконані).
+- `objective_base`:
+  - якість конфіга без урахування штрафів;
+  - використовується як secondary-критерій після feasibility/CV.
 
 Формула `score`:
 
 ```text
-base = w_cos * max_centroid_cosine
-     + w_nn  * max_nn_cross_ratio
-     - w_sil * silhouette
+objective_base = w_cos * max_centroid_cosine
+               + w_nn  * max_nn_cross_ratio
+               - w_sil * silhouette
 
-penalty = w_cos_excess * max(0, max_centroid_cosine - max_centroid_cosine_threshold)
-        + w_nn_excess  * max(0, max_nn_cross_ratio - max_nn_cross_ratio_threshold)
-        + w_sil_deficit * max(0, min_silhouette_threshold - silhouette)
+cos_rel = max(0, max_centroid_cosine - max_centroid_cosine_threshold) / (1 - max_centroid_cosine_threshold)
+nn_rel  = max(0, max_nn_cross_ratio - max_nn_cross_ratio_threshold) / max_nn_cross_ratio_threshold
+sil_rel = max(0, min_silhouette_threshold - silhouette) / min_silhouette_threshold
 
-score = base + penalty
+cv_total = w_cos_excess * cos_rel
+         + w_nn_excess  * nn_rel
+         + w_sil_deficit * sil_rel
+
+penalty = lambda(generation) * cv_total
+score = objective_base + penalty
+```
+
+Deb-style сортування:
+
+```text
+rank_key = (
+  status_is_error,   # ok краще за error
+  is_infeasible,     # feasible краще
+  cv_total,          # менше порушень краще
+  objective_base,    # краща якість серед feasible
+  score              # додатковий tie-break
+)
 ```
 
 Керування вагами:
@@ -627,11 +654,21 @@ score = base + penalty
 - збільшити `SCORE_WEIGHT_MAX_NN` — сильніше карати локальний перетік kNN;
 - збільшити `SCORE_WEIGHT_SILHOUETTE` — сильніше заохочувати глобальне розділення;
 - збільшити `SCORE_WEIGHT_*_EXCESS/DEFICIT` — зробити порогові порушення дорожчими.
+- `ADAPTIVE_PENALTY_*` керують динамікою штрафів:
+  - `ADAPTIVE_PENALTY_START` — м'який тиск на constraints на старті;
+  - `ADAPTIVE_PENALTY_END` — жорсткий тиск ближче до фіналу;
+  - `ADAPTIVE_PENALTY_POWER` — форма кривої росту штрафів.
 
 ### Артефакти та звітність
 
 - Поточний лог: stdout у консолі (деталізація керується `CONSOLE_VERBOSITY` і `DETAILED_FIRST_N_ITERS`).
   - у рядку `RESULT` є маркер `data=subset(...)/full(100%)`, який показує, на якій частині датасету виконана оцінка.
+  - у рядку `RESULT` також є decomposition `loss=(obj, pen, cv, viol, lam)`:
+    - `obj` — `objective_base` (без штрафів),
+    - `pen` — штрафна частина,
+    - `cv` — нормалізована сила порушень constraints,
+    - `viol` — кількість порушених порогів,
+    - `lam` — поточний adaptive penalty coefficient.
 - Кожен новий запуск тюнера створює окремий run-root у `output_dir`: `_tuning`, `_tuning2`, `_tuning3`, ...
 - Артефакти run-root:
   - `tuning_config.json` (snapshot налаштувань тюнера + релевантного runtime-конфіга)
