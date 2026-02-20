@@ -18,6 +18,7 @@ import csv
 import hashlib
 import io
 import json
+import shutil
 import random
 import time
 from contextlib import redirect_stdout
@@ -26,7 +27,7 @@ from pathlib import Path
 
 from src.clusterer import cluster
 from src.config import load_config
-from src.feature_extractor import extract_features
+from src.feature_extractor import extract_features, get_last_cache_info
 from src.image_scanner import scan_images
 from src.purity import evaluate_and_save_purity
 from src.reducer import reduce_dimensions
@@ -45,7 +46,7 @@ SEARCH_STRATEGY = "evolution"
 
 # Бюджет запусків (максимум реальних expensive-eval)
 # Це верхня межа кількості ПОВНИХ оцінок (reduce + cluster + purity) за запуск.
-MAX_EVALUATIONS = 600
+MAX_EVALUATIONS = 20
 
 # Параметри еволюційного пошуку (μ + λ GA)
 # EVOLUTION_POPULATION_SIZE  -> розмір популяції в кожному поколінні.
@@ -98,9 +99,40 @@ SAVE_COMPACT_STDOUT_PER_ITER = False
 # Перші N ітерацій друкуються детально навіть у compact-режимі.
 DETAILED_FIRST_N_ITERS = 2
 
+# Короткі назви директорій ітерацій:
+# True  -> evo_phase2_0076
+# False -> evo_phase2_0076_...довгі_токени...
+USE_COMPACT_ITERATION_NAMES = True
+
 # Додатковий post-step після тюнінгу:
 # для топ-N кандидатів створити повний пакет візуалізацій як у main.py.
 GENERATE_FULL_VISUALS_FOR_TOP_N = 10
+
+# Куди складати purity-артефакти під час ітеративного пошуку.
+# Важливо: це окрема папка, щоб `viz/` містив тільки візуалізації.
+PURITY_ARTIFACTS_DIR = "metrics"
+TUNING_DIR_BASENAME = "_tuning"
+
+# Ваги композитного score (менше = краще):
+# score = base + penalty
+# де:
+#   base = w_cos * max_centroid_cosine
+#        + w_nn * max_nn_cross_ratio
+#        - w_sil * silhouette
+#   penalty = w_cos_excess * max(0, max_centroid_cosine - threshold_max_cos)
+#           + w_nn_excess * max(0, max_nn_cross_ratio - threshold_max_nn)
+#           + w_sil_deficit * max(0, threshold_min_silhouette - silhouette)
+#
+# Інтуїтивно:
+# - менші max_centroid_cosine/max_nn_cross_ratio покращують score;
+# - більший silhouette покращує score;
+# - якщо метрика виходить за поріг purity, додається м'який штраф, а не жорстке відсікання.
+SCORE_WEIGHT_MAX_COS = 1.0
+SCORE_WEIGHT_MAX_NN = 0.7
+SCORE_WEIGHT_SILHOUETTE = 0.4
+SCORE_WEIGHT_COS_EXCESS = 1.5
+SCORE_WEIGHT_NN_EXCESS = 1.2
+SCORE_WEIGHT_SIL_DEFICIT = 1.0
 
 # ==========================
 # GRID SEARCH (БАГАТО ІТЕРАЦІЙ)
@@ -128,6 +160,86 @@ SEARCH_SPACE = {
 DEFAULT_MAX_TRIALS = GRID_MAX_TRIALS
 
 
+def _json_ready(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if hasattr(value, "__dict__"):
+        return {k: _json_ready(v) for k, v in vars(value).items()}
+    return value
+
+
+def _next_tuning_run_root(output_dir: Path) -> Path:
+    base = output_dir / TUNING_DIR_BASENAME
+    if not base.exists():
+        return base
+    idx = 2
+    while True:
+        candidate = output_dir / f"{TUNING_DIR_BASENAME}{idx}"
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def _tuner_settings_snapshot() -> dict:
+    return {
+        "BASE_CONFIG_PATH": BASE_CONFIG_PATH,
+        "SEARCH_STRATEGY": SEARCH_STRATEGY,
+        "MAX_EVALUATIONS": MAX_EVALUATIONS,
+        "EVOLUTION_POPULATION_SIZE": EVOLUTION_POPULATION_SIZE,
+        "EVOLUTION_ELITE_SIZE": EVOLUTION_ELITE_SIZE,
+        "EVOLUTION_TOURNAMENT_SIZE": EVOLUTION_TOURNAMENT_SIZE,
+        "EVOLUTION_MUTATION_RATE": EVOLUTION_MUTATION_RATE,
+        "EVOLUTION_RANDOM_SEED": EVOLUTION_RANDOM_SEED,
+        "EARLY_STOP_ENABLED": EARLY_STOP_ENABLED,
+        "EARLY_STOP_PATIENCE_GENERATIONS": EARLY_STOP_PATIENCE_GENERATIONS,
+        "EARLY_STOP_MIN_EVALUATIONS": EARLY_STOP_MIN_EVALUATIONS,
+        "TWO_PHASE_ENABLED": TWO_PHASE_ENABLED,
+        "PHASE1_FRACTION": PHASE1_FRACTION,
+        "PHASE1_BUDGET_RATIO": PHASE1_BUDGET_RATIO,
+        "PHASE2_TOP_K_SEEDS": PHASE2_TOP_K_SEEDS,
+        "GRID_MAX_TRIALS": GRID_MAX_TRIALS,
+        "REUSE_IMAGE_INDEX": REUSE_IMAGE_INDEX,
+        "IMAGE_INDEX_FILENAME": IMAGE_INDEX_FILENAME,
+        "FORCE_RESCAN": FORCE_RESCAN,
+        "VERIFY_IMAGE_INDEX_PATHS": VERIFY_IMAGE_INDEX_PATHS,
+        "CONSOLE_VERBOSITY": CONSOLE_VERBOSITY,
+        "SHOW_OVERRIDES_EACH_ITER": SHOW_OVERRIDES_EACH_ITER,
+        "SAVE_COMPACT_STDOUT_PER_ITER": SAVE_COMPACT_STDOUT_PER_ITER,
+        "DETAILED_FIRST_N_ITERS": DETAILED_FIRST_N_ITERS,
+        "USE_COMPACT_ITERATION_NAMES": USE_COMPACT_ITERATION_NAMES,
+        "GENERATE_FULL_VISUALS_FOR_TOP_N": GENERATE_FULL_VISUALS_FOR_TOP_N,
+        "PURITY_ARTIFACTS_DIR": PURITY_ARTIFACTS_DIR,
+        "SCORE_WEIGHTS": {
+            "SCORE_WEIGHT_MAX_COS": SCORE_WEIGHT_MAX_COS,
+            "SCORE_WEIGHT_MAX_NN": SCORE_WEIGHT_MAX_NN,
+            "SCORE_WEIGHT_SILHOUETTE": SCORE_WEIGHT_SILHOUETTE,
+            "SCORE_WEIGHT_COS_EXCESS": SCORE_WEIGHT_COS_EXCESS,
+            "SCORE_WEIGHT_NN_EXCESS": SCORE_WEIGHT_NN_EXCESS,
+            "SCORE_WEIGHT_SIL_DEFICIT": SCORE_WEIGHT_SIL_DEFICIT,
+        },
+        "SEARCH_SPACE": SEARCH_SPACE,
+        "DEFAULT_MAX_TRIALS": DEFAULT_MAX_TRIALS,
+    }
+
+
+def _runtime_config_snapshot(cfg) -> dict:
+    return {
+        "input_dir": cfg.input_dir,
+        "output_dir": cfg.output_dir,
+        "model": cfg.model,
+        "preprocessing": cfg.preprocessing,
+        "cache": cfg.cache,
+        "acceleration": cfg.acceleration,
+        "reduction": cfg.reduction,
+        "clustering": cfg.clustering,
+        "purity": cfg.purity,
+    }
+
+
 def _build_iterations(max_trials: int) -> list[dict]:
     keys = list(SEARCH_SPACE.keys())
     values_grid = [SEARCH_SPACE[k] for k in keys]
@@ -140,15 +252,18 @@ def _build_iterations(max_trials: int) -> list[dict]:
             overrides.setdefault(section, {})
             overrides[section][param] = value
 
-        # Формуємо стабільну коротку назву ітерації.
-        tokens = []
-        for dotted_key in keys:
-            section, param = dotted_key.split(".", 1)
-            value = flat[dotted_key]
-            short = param.replace("cluster_selection_", "csel_").replace("_", "")
-            val_s = str(value).replace(".", "_")
-            tokens.append(f"{section[0]}{short}{val_s}")
-        name = f"iter_{idx:04d}_" + "_".join(tokens[:6])
+        if USE_COMPACT_ITERATION_NAMES:
+            name = f"iter_{idx:04d}"
+        else:
+            # Формуємо стабільну назву з токенами параметрів.
+            tokens = []
+            for dotted_key in keys:
+                section, param = dotted_key.split(".", 1)
+                value = flat[dotted_key]
+                short = param.replace("cluster_selection_", "csel_").replace("_", "")
+                val_s = str(value).replace(".", "_")
+                tokens.append(f"{section[0]}{short}{val_s}")
+            name = f"iter_{idx:04d}_" + "_".join(tokens[:6])
 
         all_combos.append(
             {
@@ -189,6 +304,8 @@ def _candidate_signature(flat: dict, keys: list[str]) -> tuple:
 
 
 def _candidate_name(prefix: str, idx: int, flat: dict, keys: list[str]) -> str:
+    if USE_COMPACT_ITERATION_NAMES:
+        return f"{prefix}_{idx:04d}"
     tokens = []
     for dotted_key in keys:
         section, param = dotted_key.split(".", 1)
@@ -238,11 +355,53 @@ def _apply_section_overrides(base_cfg, overrides: dict):
     return cfg
 
 
+def _compute_dynamic_score(item: dict) -> tuple[float, dict]:
+    """Композитний score без жорсткого відсікання по verdict (менше = краще)."""
+    cos = item.get("max_centroid_cosine")
+    sil = item.get("silhouette")
+    nn = item.get("max_nn_cross_ratio")
+    th = item.get("thresholds", {})
+
+    # Missing-метрики: великий штраф, але не краш ранжування.
+    if cos is None or nn is None:
+        return 9999.0, {"reason": "missing_core_metrics"}
+
+    sil_safe = sil if sil is not None else -1.0
+    base = (
+        SCORE_WEIGHT_MAX_COS * cos
+        + SCORE_WEIGHT_MAX_NN * nn
+        - SCORE_WEIGHT_SILHOUETTE * sil_safe
+    )
+
+    cos_thr = th.get("max_centroid_cosine", 1.0)
+    nn_thr = th.get("max_nn_cross_ratio", 1.0)
+    sil_thr = th.get("min_silhouette", 0.0)
+    cos_excess = max(0.0, cos - cos_thr)
+    nn_excess = max(0.0, nn - nn_thr)
+    sil_deficit = max(0.0, sil_thr - sil_safe)
+
+    penalty = (
+        SCORE_WEIGHT_COS_EXCESS * cos_excess
+        + SCORE_WEIGHT_NN_EXCESS * nn_excess
+        + SCORE_WEIGHT_SIL_DEFICIT * sil_deficit
+    )
+    score = base + penalty
+    return score, {
+        "base": base,
+        "penalty": penalty,
+        "cos_excess": cos_excess,
+        "nn_excess": nn_excess,
+        "sil_deficit": sil_deficit,
+    }
+
+
 def _score_for_sort(item: dict) -> tuple:
     """Менше значення -> кращий результат."""
-    verdict_penalty = 0 if item["verdict"] == "PASS" else 1
+    score = item.get("score")
+    if score is None:
+        score = 9999.0
     return (
-        verdict_penalty,
+        score,
         item["max_centroid_cosine"] if item["max_centroid_cosine"] is not None else 999.0,
         -(item["silhouette"] if item["silhouette"] is not None else -999.0),
         item["max_nn_cross_ratio"] if item["max_nn_cross_ratio"] is not None else 999.0,
@@ -292,6 +451,7 @@ def _load_or_build_image_index(cfg, output_root: Path):
 
 def _evaluate_iteration(
     cfg,
+    run_root: Path,
     features,
     flat_candidate: dict,
     name: str,
@@ -306,7 +466,20 @@ def _evaluate_iteration(
     ccfg = _apply_section_overrides(cfg.clustering, clu_over)
     purity_cfg = _apply_section_overrides(cfg.purity, pur_over)
 
-    trial_output = cfg.output_dir / "_tuning" / name
+    trial_output = run_root / name
+    trial_output.mkdir(parents=True, exist_ok=True)
+
+    # Явний конфіг ітерації: тільки параметри, які змінені відносно базового config.yaml.
+    iteration_cfg_path = trial_output / "iteration_config.json"
+    iteration_cfg_payload = {
+        "name": name,
+        "base_config_path": BASE_CONFIG_PATH,
+        "changed_params": dict(flat_candidate),
+    }
+    iteration_cfg_path.write_text(
+        json.dumps(iteration_cfg_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     captured_stdout = ""
     use_compact = (CONSOLE_VERBOSITY == "compact") and (not force_full_logs)
     if use_compact:
@@ -319,9 +492,11 @@ def _evaluate_iteration(
                 embeddings=embeddings,
                 labels=labels,
                 output_dir=trial_output,
-                viz_dir_name="viz",
+                viz_dir_name=PURITY_ARTIFACTS_DIR,
                 cfg=purity_cfg,
                 accel_cfg=cfg.acceleration,
+                report_filename=f"iteration_metric_{name}.json",
+                matrix_filename=f"cosine_{name}.npy",
             )
         captured_stdout = buf.getvalue()
         if SAVE_COMPACT_STDOUT_PER_ITER and captured_stdout.strip():
@@ -336,29 +511,43 @@ def _evaluate_iteration(
             embeddings=embeddings,
             labels=labels,
             output_dir=trial_output,
-            viz_dir_name="viz",
+            viz_dir_name=PURITY_ARTIFACTS_DIR,
             cfg=purity_cfg,
             accel_cfg=cfg.acceleration,
+            report_filename=f"iteration_metric_{name}.json",
+            matrix_filename=f"cosine_{name}.npy",
         )
 
     m = purity["metrics"]
     warn_count = 0
     if captured_stdout:
         warn_count = sum(1 for ln in captured_stdout.splitlines() if "[WARN]" in ln)
-    return {
+    thresholds = {
+        "max_centroid_cosine": purity_cfg.max_centroid_cosine,
+        "min_silhouette": purity_cfg.min_silhouette,
+        "max_nn_cross_ratio": purity_cfg.max_nn_cross_ratio,
+    }
+    row = {
         "name": name,
         "verdict": purity["verdict"],
+        "checks_passed": purity["verdict"] == "PASS",
         "n_clusters": purity["run"]["n_clusters"],
         "max_centroid_cosine": m["max_centroid_cosine"],
         "silhouette": m["silhouette_mean"],
         "max_nn_cross_ratio": m["max_nn_cross_ratio"],
         "leakage_candidates": len(purity.get("leakage_candidates", [])),
-        "report_path": str(trial_output / "viz" / "purity_report_latest.json"),
+        "report_path": str(trial_output / PURITY_ARTIFACTS_DIR / f"iteration_metric_{name}.json"),
         "params": overrides,
         "flat_params": dict(flat_candidate),
         "warn_count": warn_count,
         "status": "ok",
+        "thresholds": thresholds,
+        "iteration_config_path": str(iteration_cfg_path),
     }
+    score, score_parts = _compute_dynamic_score(row)
+    row["score"] = score
+    row["score_parts"] = score_parts
+    return row
 
 
 def _save_tuning_plots(summary_dir: Path, results: list[dict], top_results: list[dict]) -> list[str]:
@@ -443,8 +632,12 @@ def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
     """Save all tuning runs and metrics to CSV."""
     csv_path = summary_dir / "tuning_results_all.csv"
     fieldnames = [
+        "section",
+        "rank",
         "name",
+        "score",
         "status",
+        "checks_passed",
         "verdict",
         "n_clusters",
         "max_centroid_cosine",
@@ -454,6 +647,7 @@ def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
         "warn_count",
         "elapsed_sec",
         "report_path",
+        "iteration_config_path",
         "params_json",
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as f:
@@ -462,8 +656,12 @@ def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
         for row in results:
             writer.writerow(
                 {
+                    "section": "all",
+                    "rank": "",
                     "name": row.get("name", ""),
+                    "score": row.get("score"),
                     "status": row.get("status", ""),
+                    "checks_passed": row.get("checks_passed", False),
                     "verdict": row.get("verdict", ""),
                     "n_clusters": row.get("n_clusters"),
                     "max_centroid_cosine": row.get("max_centroid_cosine"),
@@ -473,6 +671,32 @@ def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
                     "warn_count": row.get("warn_count", 0),
                     "elapsed_sec": row.get("elapsed_sec"),
                     "report_path": row.get("report_path", ""),
+                    "iteration_config_path": row.get("iteration_config_path", ""),
+                    "params_json": json.dumps(row.get("params", {}), ensure_ascii=False),
+                }
+            )
+        ok_results = [r for r in results if r.get("status") == "ok"]
+        top_sorted = sorted(ok_results, key=_score_for_sort)[:20]
+        writer.writerow({})
+        for i, row in enumerate(top_sorted, 1):
+            writer.writerow(
+                {
+                    "section": "top",
+                    "rank": i,
+                    "name": row.get("name", ""),
+                    "score": row.get("score"),
+                    "status": row.get("status", ""),
+                    "checks_passed": row.get("checks_passed", False),
+                    "verdict": row.get("verdict", ""),
+                    "n_clusters": row.get("n_clusters"),
+                    "max_centroid_cosine": row.get("max_centroid_cosine"),
+                    "silhouette": row.get("silhouette"),
+                    "max_nn_cross_ratio": row.get("max_nn_cross_ratio"),
+                    "leakage_candidates": row.get("leakage_candidates"),
+                    "warn_count": row.get("warn_count", 0),
+                    "elapsed_sec": row.get("elapsed_sec"),
+                    "report_path": row.get("report_path", ""),
+                    "iteration_config_path": row.get("iteration_config_path", ""),
                     "params_json": json.dumps(row.get("params", {}), ensure_ascii=False),
                 }
             )
@@ -481,6 +705,7 @@ def _save_all_results_csv(summary_dir: Path, results: list[dict]) -> Path:
 
 def _generate_full_visualizations_for_top_n(
     cfg,
+    run_root: Path,
     image_paths,
     features,
     results_sorted: list[dict],
@@ -511,7 +736,7 @@ def _generate_full_visualizations_for_top_n(
         ccfg = _apply_section_overrides(cfg.clustering, clu_over)
         purity_cfg = _apply_section_overrides(cfg.purity, pur_over)
 
-        run_dir = cfg.output_dir / "_tuning" / "_top_visuals" / f"top_{rank:02d}_{name}"
+        run_dir = run_root / "_top_visuals" / f"top_{rank:02d}_{name}"
         run_dir.mkdir(parents=True, exist_ok=True)
 
         t0 = time.time()
@@ -522,9 +747,11 @@ def _generate_full_visualizations_for_top_n(
             embeddings=embeddings,
             labels=labels,
             output_dir=run_dir,
-            viz_dir_name=cfg.visualization.viz_dir,
+            viz_dir_name=PURITY_ARTIFACTS_DIR,
             cfg=purity_cfg,
             accel_cfg=cfg.acceleration,
+            report_filename=f"iteration_metric_top_{rank:02d}_{name}.json",
+            matrix_filename=f"cosine_top_{rank:02d}_{name}.npy",
         )
         if cfg.visualization.enabled:
             visualize(
@@ -538,6 +765,7 @@ def _generate_full_visualizations_for_top_n(
         elapsed = time.time() - t0
 
         viz_dir = run_dir / cfg.visualization.viz_dir
+        metrics_dir = run_dir / PURITY_ARTIFACTS_DIR
         generated.append(
             {
                 "rank": rank,
@@ -545,7 +773,7 @@ def _generate_full_visualizations_for_top_n(
                 "verdict": purity["verdict"],
                 "output_dir": str(run_dir),
                 "viz_dir": str(viz_dir),
-                "purity_report": str(viz_dir / "purity_report_latest.json"),
+                "purity_report": str(metrics_dir / f"iteration_metric_top_{rank:02d}_{name}.json"),
                 "interactive_scatter": str(viz_dir / "interactive_scatter.html"),
                 "cluster_sizes": str(viz_dir / "cluster_sizes.png"),
                 "cluster_grid": str(viz_dir / "cluster_grid.png"),
@@ -560,6 +788,7 @@ def _generate_full_visualizations_for_top_n(
 
 def _run_evolution_search(
     cfg,
+    run_root: Path,
     keys: list[str],
     features,
     max_trials: int,
@@ -586,6 +815,8 @@ def _run_evolution_search(
         if row["status"] == "ok":
             print(
                 "  RESULT:",
+                f"score={row.get('score', float('nan')):.4f},",
+                f"checks={row.get('checks_passed', False)},",
                 f"verdict={row['verdict']},",
                 f"clusters={row['n_clusters']},",
                 f"max_cos={row['max_centroid_cosine']:.4f},",
@@ -653,6 +884,7 @@ def _run_evolution_search(
             try:
                 row = _evaluate_iteration(
                     cfg,
+                    run_root,
                     features,
                     cand,
                     name,
@@ -661,7 +893,8 @@ def _run_evolution_search(
             except Exception as exc:
                 row = {
                     "name": name,
-                    "verdict": "FAIL",
+                    "verdict": "N/A",
+                    "checks_passed": False,
                     "n_clusters": -1,
                     "max_centroid_cosine": None,
                     "silhouette": None,
@@ -671,6 +904,8 @@ def _run_evolution_search(
                     "params": _flat_to_overrides(cand),
                     "flat_params": dict(cand),
                     "status": f"error: {type(exc).__name__}: {exc}",
+                    "score": None,
+                    "iteration_config_path": "",
                 }
 
             elapsed_iter = time.time() - t_iter
@@ -758,13 +993,16 @@ def main() -> None:
 
     cfg = load_config(config_path)
     keys = _space_keys()
+    run_root = _next_tuning_run_root(cfg.output_dir)
+    run_root.mkdir(parents=True, exist_ok=False)
 
     print("=" * 72)
-    print("  ITERATIVE TUNING: PTZ PRESET CLUSTERING")
+    print("  ITERATIVE TUNING: CLUSTER SEARCH")
     print("=" * 72)
     print(f"Config:  {config_path}")
     print(f"Input:   {cfg.input_dir}")
     print(f"Output:  {cfg.output_dir}")
+    print(f"Run root: {run_root}")
     print(f"Strategy: {strategy}")
     print(f"Max evaluations: {max_trials}")
     print(f"Two-phase: {TWO_PHASE_ENABLED} (phase1_fraction={PHASE1_FRACTION})")
@@ -782,6 +1020,21 @@ def main() -> None:
     print("\n[2/4] Витягування ознак (1 раз для всіх ітерацій)...")
     features = extract_features(image_paths, cfg.model, cfg.preprocessing, cfg.cache)
     print(f"  Features: {features.shape}")
+    tuning_manifest = {
+        "base_config_path": config_path,
+        "run_root": run_root,
+        "tuner_settings": _tuner_settings_snapshot(),
+        "runtime_config": _runtime_config_snapshot(cfg),
+    }
+    (run_root / "tuning_config.json").write_text(
+        json.dumps(_json_ready(tuning_manifest), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    cache_info = get_last_cache_info()
+    if cache_info and cache_info.get("cache_manifest_path"):
+        src_manifest = Path(cache_info["cache_manifest_path"])
+        if src_manifest.exists():
+            shutil.copy2(src_manifest, run_root / "_cache_config.json")
 
     print("\n[3/4] Ітеративний прогін конфігів...")
     results = []
@@ -800,6 +1053,8 @@ def main() -> None:
             if row["status"] == "ok":
                 print(
                     "  RESULT:",
+                    f"score={row.get('score', float('nan')):.4f},",
+                    f"checks={row.get('checks_passed', False)},",
                     f"verdict={row['verdict']},",
                     f"clusters={row['n_clusters']},",
                     f"max_cos={row['max_centroid_cosine']:.4f},",
@@ -843,6 +1098,7 @@ def main() -> None:
             try:
                 row = _evaluate_iteration(
                     cfg,
+                    run_root,
                     features,
                     flat,
                     name,
@@ -851,7 +1107,8 @@ def main() -> None:
             except Exception as exc:
                 row = {
                     "name": name,
-                    "verdict": "FAIL",
+                    "verdict": "N/A",
+                    "checks_passed": False,
                     "n_clusters": -1,
                     "max_centroid_cosine": None,
                     "silhouette": None,
@@ -861,6 +1118,8 @@ def main() -> None:
                     "params": it.get("overrides", {}),
                     "flat_params": flat,
                     "status": f"error: {type(exc).__name__}: {exc}",
+                    "score": None,
+                    "iteration_config_path": "",
                 }
             elapsed_iter = time.time() - t_iter
             row["elapsed_sec"] = round(elapsed_iter, 4)
@@ -879,6 +1138,7 @@ def main() -> None:
             )
             phase1_results = _run_evolution_search(
                 cfg=cfg,
+                run_root=run_root,
                 keys=keys,
                 features=features_phase1,
                 max_trials=phase1_budget,
@@ -900,6 +1160,7 @@ def main() -> None:
                 print("#" * 72)
                 phase2_results = _run_evolution_search(
                     cfg=cfg,
+                    run_root=run_root,
                     keys=keys,
                     features=features,
                     max_trials=phase2_budget,
@@ -911,6 +1172,7 @@ def main() -> None:
         else:
             phase_results = _run_evolution_search(
                 cfg=cfg,
+                run_root=run_root,
                 keys=keys,
                 features=features,
                 max_trials=max_trials,
@@ -932,6 +1194,8 @@ def main() -> None:
     for i, r in enumerate(results_sorted, 1):
         print(
             f"{i:>2}. {r['name']:<22} "
+            f"score={r.get('score', float('nan')):.4f} "
+            f"checks={r.get('checks_passed', False)!s:<5} "
             f"{r['verdict']:<4} "
             f"clusters={r['n_clusters']:<4} "
             f"max_cos={r['max_centroid_cosine']:.4f} "
@@ -942,11 +1206,14 @@ def main() -> None:
 
     best = results_sorted[0]
     print("-" * 72)
-    print(f"BEST: {best['name']} | verdict={best['verdict']} | report={best['report_path']}")
+    print(
+        f"BEST: {best['name']} | score={best.get('score', float('nan')):.4f} "
+        f"| verdict={best['verdict']} | report={best['report_path']}"
+    )
     print(f"BEST reduction:  {best['params']['reduction']}")
     print(f"BEST clustering: {best['params']['clustering']}")
 
-    summary_dir = cfg.output_dir / "_tuning"
+    summary_dir = run_root
     summary_dir.mkdir(parents=True, exist_ok=True)
     summary_path = summary_dir / "tuning_summary_latest.json"
     summary = {
@@ -981,6 +1248,7 @@ def main() -> None:
         try:
             full_visual_runs = _generate_full_visualizations_for_top_n(
                 cfg=cfg,
+                run_root=run_root,
                 image_paths=image_paths,
                 features=features,
                 results_sorted=results_sorted,

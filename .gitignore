@@ -1,3 +1,4 @@
 dataset_filtering_by_presets_env/
+wsl2_rapids_env/
 __pycache__/
 .cache/

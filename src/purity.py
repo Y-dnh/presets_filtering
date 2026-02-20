@@ -60,6 +60,8 @@ def evaluate_and_save_purity(
     viz_dir_name: str,
     cfg: PurityConfig,
     accel_cfg: AccelerationConfig,
+    report_filename: str = "purity_report_latest.json",
+    matrix_filename: str = "centroid_cosine_matrix.npy",
 ) -> Dict:
     """Evaluate cluster isolation and save purity report artifacts."""
     global _RAPIDS_PURITY_DISABLED
@@ -103,10 +105,8 @@ def evaluate_and_save_purity(
         ]
         report["verdict"] = "FAIL"
 
-        latest = viz_dir / "purity_report_latest.json"
-        latest.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        ts_report = viz_dir / f"purity_report_{run_ts}.json"
-        ts_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        report_path = viz_dir / report_filename
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         return report
 
     # --- Centroids in feature-space ---
@@ -340,12 +340,9 @@ def evaluate_and_save_purity(
     report["per_cluster"] = per_cluster
 
     # Save artifacts
-    np.save(viz_dir / "centroid_cosine_matrix.npy", cosine_matrix)
-    np.save(viz_dir / f"centroid_cosine_matrix_{run_ts}.npy", cosine_matrix)
-    latest = viz_dir / "purity_report_latest.json"
-    latest.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    ts_report = viz_dir / f"purity_report_{run_ts}.json"
-    ts_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    np.save(viz_dir / matrix_filename, cosine_matrix)
+    report_path = viz_dir / report_filename
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("")
     print("=== PURITY REPORT ===")
@@ -356,7 +353,7 @@ def evaluate_and_save_purity(
         print(f"  silhouette_mean:      {silhouette:.4f} (поріг >= {cfg.min_silhouette})")
     print(f"  max_nn_cross_ratio:   {max_nn_cross_ratio:.4f} (поріг < {cfg.max_nn_cross_ratio})")
     print(f"  verdict:              {verdict}")
-    print(f"  report:               {latest}")
+    print(f"  report:               {report_path}")
     print("")
 
     return report

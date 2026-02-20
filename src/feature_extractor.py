@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
 
@@ -17,6 +18,7 @@ from .config import CacheConfig, ModelConfig, PreprocessingConfig
 
 # Avoid OpenCV thread oversubscription inside PyTorch DataLoader workers.
 cv2.setNumThreads(0)
+_LAST_CACHE_INFO: dict | None = None
 
 
 def _resolve_device(device_cfg: str) -> torch.device:
@@ -162,6 +164,59 @@ def _compute_cache_key(
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
+def _compute_files_hash(image_paths: List[Path]) -> str:
+    raw = json.dumps([str(p) for p in image_paths], sort_keys=False).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _cache_manifest_payload(
+    image_paths: List[Path],
+    model_cfg: ModelConfig,
+    preproc_cfg: PreprocessingConfig,
+    cache_key: str,
+    cache_cfg: CacheConfig,
+) -> dict:
+    return {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "cache_key": cache_key,
+        "cache_path": str(Path(cache_cfg.cache_dir) / f"features_{cache_key}.npy"),
+        "input": {
+            "n_files": len(image_paths),
+            "files_hash_sha256": _compute_files_hash(image_paths),
+        },
+        "model": {
+            "name": model_cfg.name,
+            "image_size": model_cfg.image_size,
+        },
+        "preprocessing": {
+            "equalization": preproc_cfg.equalization,
+            "clahe_clip_limit": preproc_cfg.clahe_clip_limit,
+            "clahe_grid_size": preproc_cfg.clahe_grid_size,
+            "polarity_invariant": preproc_cfg.polarity_invariant,
+            "l2_normalize": preproc_cfg.l2_normalize,
+            "trim_top": preproc_cfg.trim_top,
+            "trim_bottom": preproc_cfg.trim_bottom,
+            "trim_left": preproc_cfg.trim_left,
+            "trim_right": preproc_cfg.trim_right,
+        },
+    }
+
+
+def _write_cache_manifest(cache_cfg: CacheConfig, cache_key: str, payload: dict) -> Path | None:
+    if not cache_cfg.enabled:
+        return None
+    cache_dir = Path(cache_cfg.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = cache_dir / f"cache_config_{cache_key}.json"
+    manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest_path
+
+
+def get_last_cache_info() -> dict | None:
+    """Return metadata for last extract_features call."""
+    return dict(_LAST_CACHE_INFO) if _LAST_CACHE_INFO is not None else None
+
+
 def _try_load_cache(cache_cfg: CacheConfig, cache_key: str) -> np.ndarray | None:
     if not cache_cfg.enabled:
         return None
@@ -191,9 +246,27 @@ def extract_features(
     via DataLoader, while GPU inference runs on the main thread. This keeps
     the GPU saturated instead of waiting for single-threaded CPU work.
     """
+    global _LAST_CACHE_INFO
     cache_key = _compute_cache_key(image_paths, model_cfg, preproc_cfg)
+    manifest_payload = _cache_manifest_payload(
+        image_paths=image_paths,
+        model_cfg=model_cfg,
+        preproc_cfg=preproc_cfg,
+        cache_key=cache_key,
+        cache_cfg=cache_cfg,
+    )
+    manifest_path = _write_cache_manifest(cache_cfg, cache_key, manifest_payload)
+    _LAST_CACHE_INFO = {
+        "cache_enabled": cache_cfg.enabled,
+        "cache_key": cache_key,
+        "cache_path": str(Path(cache_cfg.cache_dir) / f"features_{cache_key}.npy"),
+        "cache_manifest_path": str(manifest_path) if manifest_path is not None else None,
+        "cache_hit": False,
+    }
     cached = _try_load_cache(cache_cfg, cache_key)
     if cached is not None:
+        if _LAST_CACHE_INFO is not None:
+            _LAST_CACHE_INFO["cache_hit"] = True
         print(f"  Завантажено з кешу ({cached.shape[0]} зображень, {cached.shape[1]}-dim)")
         return cached
 
@@ -256,4 +329,6 @@ def extract_features(
     print(f"  Розмір ознак: {features.shape}")
 
     _save_cache(cache_cfg, cache_key, features)
+    if _LAST_CACHE_INFO is not None:
+        _LAST_CACHE_INFO["cache_hit"] = False
     return features

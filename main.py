@@ -7,17 +7,60 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import sys
 import time
+from pathlib import Path
 
 from src.config import load_config
 from src.image_scanner import scan_images
-from src.feature_extractor import extract_features
+from src.feature_extractor import extract_features, get_last_cache_info
 from src.reducer import reduce_dimensions
 from src.clusterer import cluster, build_report
 from src.organizer import organize_files
 from src.visualizer import visualize
 from src.purity import evaluate_and_save_purity
+
+PURITY_ARTIFACTS_DIR = "metrics"
+
+
+def _json_ready(value):
+    if hasattr(value, "__dict__"):
+        return {k: _json_ready(v) for k, v in vars(value).items()}
+    if isinstance(value, dict):
+        return {k: _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    return str(value) if hasattr(value, "as_posix") else value
+
+
+def _write_main_metrics_manifest(cfg, config_path: str, metrics_dir):
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    cache_info = get_last_cache_info()
+    manifest = {
+        "config_path": config_path,
+        "runtime_config": {
+            "input_dir": cfg.input_dir,
+            "output_dir": cfg.output_dir,
+            "model": cfg.model,
+            "preprocessing": cfg.preprocessing,
+            "cache": cfg.cache,
+            "acceleration": cfg.acceleration,
+            "reduction": cfg.reduction,
+            "clustering": cfg.clustering,
+            "purity": cfg.purity,
+        },
+        "cache": cache_info,
+    }
+    (metrics_dir / "global_run_config.json").write_text(
+        json.dumps(_json_ready(manifest), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    if cache_info and cache_info.get("cache_manifest_path"):
+        manifest_path = cache_info["cache_manifest_path"]
+        if manifest_path and Path(manifest_path).exists():
+            shutil.copy2(manifest_path, metrics_dir / "_cache_config.json")
 
 
 def main() -> None:
@@ -50,6 +93,7 @@ def main() -> None:
     t0 = time.time()
     features = extract_features(image_paths, cfg.model, cfg.preprocessing, cfg.cache)
     print(f"  Час: {time.time() - t0:.1f}с")
+    _write_main_metrics_manifest(cfg, config_path, cfg.output_dir / PURITY_ARTIFACTS_DIR)
 
     # 4. Зменшення розмірності
     print("\n[4/7] Зменшення розмірності (PCA + UMAP)...")
@@ -76,15 +120,18 @@ def main() -> None:
             embeddings=embeddings,
             labels=labels,
             output_dir=cfg.output_dir,
-            viz_dir_name=cfg.visualization.viz_dir,
+            viz_dir_name=PURITY_ARTIFACTS_DIR,
             cfg=cfg.purity,
             accel_cfg=cfg.acceleration,
         )
         print(f"  Час: {time.time() - t0:.1f}с")
         if purity_report["verdict"] == "FAIL" and cfg.purity.fail_on_fail:
             print("  Purity FAIL: розкладання файлів заблоковано (purity.fail_on_fail: true).")
-            print(f"  Перевірте звіт: {cfg.output_dir / cfg.visualization.viz_dir / 'purity_report_latest.json'}")
+            print(f"  Перевірте звіт: {cfg.output_dir / PURITY_ARTIFACTS_DIR / 'purity_report_latest.json'}")
             sys.exit(2)
+        if purity_report["verdict"] == "FAIL" and not cfg.purity.fail_on_fail:
+            print("  Purity FAIL: блокування вимкнено, продовжуємо (purity.fail_on_fail: false).")
+            print("  Рішення про розкладання приймається вручну після перегляду метрик та візуалізацій.")
     else:
         print("\n[6/8] Валідація чистоти вимкнена (purity.enabled: false)")
 
